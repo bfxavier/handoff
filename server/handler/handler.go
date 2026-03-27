@@ -41,7 +41,30 @@ func New(s *store.Store, rdb *redis.Client, cfg Config) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	// Wrap response to catch ServeMux's default 404 and return JSON instead
+	wrapped := &jsonNotFoundWriter{ResponseWriter: w, req: r}
+	s.mux.ServeHTTP(wrapped, r)
+	if !wrapped.written {
+		apiError(w, 404, "NOT_FOUND", "Route not found")
+	}
+}
+
+type jsonNotFoundWriter struct {
+	http.ResponseWriter
+	req     *http.Request
+	written bool
+}
+
+func (w *jsonNotFoundWriter) WriteHeader(code int) {
+	w.written = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *jsonNotFoundWriter) Write(b []byte) (int, error) {
+	if !w.written {
+		w.written = true
+	}
+	return w.ResponseWriter.Write(b)
 }
 
 // ---- JSON helpers ----
@@ -478,8 +501,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(200)
 
-	// Initial padding to push through reverse proxy buffers
-	fmt.Fprintf(w, ":%s\n:ok\n\n", strings.Repeat("_", 2048))
+	// Initial padding to push through reverse proxy buffers (Traefik needs ~4KB+)
+	fmt.Fprintf(w, ":%s\n:ok\n\n", strings.Repeat("_", 8192))
 	flusher.Flush()
 
 	cursor := lastEventID
