@@ -1,17 +1,14 @@
-FROM node:22-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
-COPY tsconfig.json ./
-COPY src/ src/
-RUN npx tsc
+COPY server/go.mod server/go.sum ./
+RUN go mod download
+COPY server/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -o handoff .
 
-FROM node:22-alpine
-RUN apk add --no-cache curl
+FROM alpine:3.21
+RUN apk add --no-cache curl ca-certificates
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
-COPY --from=build /app/dist/ dist/
+COPY --from=build /app/handoff .
 COPY public/ public/
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["./handoff"]
