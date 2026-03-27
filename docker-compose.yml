@@ -25,8 +25,7 @@ services:
       timeout: 10s
       retries: 5
     labels:
-      - "traefik.http.middlewares.handoff-buffering.buffering.maxResponseBodyBytes=0"
-      - "traefik.http.middlewares.handoff-buffering.buffering.memResponseBodyBytes=0"
+      - "traefik.http.services.server.loadbalancer.responseforwarding.flushinterval=1ms"
 
 volumes:
   redis-data:
