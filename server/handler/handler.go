@@ -44,23 +44,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Wrap response to catch ServeMux's default 404 and return JSON instead
 	wrapped := &jsonNotFoundWriter{ResponseWriter: w, req: r}
 	s.mux.ServeHTTP(wrapped, r)
-	if !wrapped.written {
+	if !wrapped.written || wrapped.intercepted {
 		apiError(w, 404, "NOT_FOUND", "Route not found")
 	}
 }
 
 type jsonNotFoundWriter struct {
 	http.ResponseWriter
-	req     *http.Request
-	written bool
+	req        *http.Request
+	written    bool
+	intercepted bool
 }
 
 func (w *jsonNotFoundWriter) WriteHeader(code int) {
+	if code == 404 && !w.written {
+		// Intercept ServeMux's default 404 — we'll write JSON instead
+		w.intercepted = true
+		return
+	}
 	w.written = true
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *jsonNotFoundWriter) Write(b []byte) (int, error) {
+	if w.intercepted {
+		// Swallow ServeMux's "404 page not found" body
+		return len(b), nil
+	}
 	if !w.written {
 		w.written = true
 	}
