@@ -1,8 +1,20 @@
 {
-  "name": "agent-relay",
-  "version": "0.3.0",
-  "description": "Agent-to-agent coordination relay — MCP server + hosted API",
+  "name": "handoff-sdk",
+  "version": "0.4.0",
+  "description": "Agent-to-agent coordination relay — SDK, MCP server + hosted API",
   "type": "module",
+  "main": "dist/sdk.js",
+  "types": "dist/sdk.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/sdk.js",
+      "types": "./dist/sdk.d.ts"
+    },
+    "./types": {
+      "import": "./dist/types.js",
+      "types": "./dist/types.d.ts"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",

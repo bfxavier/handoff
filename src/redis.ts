@@ -1,9 +1,9 @@
 import { Redis } from "ioredis";
 import type {
-  Channel, Message, ReadResult, Status, StatusChange, Ack,
+  Channel, Message, ReadResult, Status, StatusChange, Ack, ThreadResult,
 } from "./types.js";
 
-export { type Channel, type Message, type ReadResult, type Status, type StatusChange, type Ack };
+export { type Channel, type Message, type ReadResult, type Status, type StatusChange, type Ack, type ThreadResult };
 
 type StreamEntry = [id: string, fields: string[]];
 
@@ -30,6 +30,8 @@ function parseMessage(channel: string, entry: StreamEntry): Message {
     sender: data.sender || "unknown",
     content: data.content || "",
     mention: data.mention || null,
+    thread_id: data.thread_id || null,
+    reply_count: parseInt(data.reply_count || "0", 10),
     created_at: data.created_at || "",
   };
 }
@@ -120,6 +122,16 @@ export class RelayStore {
     pipeline.del(this.k(`acks:${name}`));
     pipeline.del(this.k(`status:${name}`));
     pipeline.del(this.k(`slog:${name}`));
+    // Thread reply streams are keyed as thr:{channel}:{parentId} — scan and delete
+    const pattern = this.k(`thr:${name}:*`);
+    let cursor = "0";
+    do {
+      const [next, keys] = await this.redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+      cursor = next;
+      if (keys.length > 0) {
+        await this.redis.del(...keys);
+      }
+    } while (cursor !== "0");
     await pipeline.exec();
     return true;
   }
@@ -128,7 +140,8 @@ export class RelayStore {
     channel: string,
     sender: string,
     content: string,
-    mention?: string
+    mention?: string,
+    threadId?: string
   ): Promise<Message> {
     await this.ensureChannel(channel);
     const now = new Date().toISOString();
@@ -136,14 +149,26 @@ export class RelayStore {
       "sender", sender, "content", content, "created_at", now,
     ];
     if (mention) fields.push("mention", mention);
+    if (threadId) fields.push("thread_id", threadId);
 
+    // Post to main channel stream
     const id = await this.redis.xadd(this.k(`msg:${channel}`), "*", ...fields);
+
+    // If this is a reply, also add to the thread stream and bump reply_count on parent
+    if (threadId) {
+      const threadKey = this.k(`thr:${channel}:${threadId}`);
+      await this.redis.xadd(threadKey, id!, ...fields);
+      await this.redis.hincrby(this.k(`thrc:${channel}`), threadId, 1);
+    }
+
     return {
       id: id!,
       channel,
       sender,
       content,
       mention: mention || null,
+      thread_id: threadId || null,
+      reply_count: 0,
       created_at: now,
     };
   }
@@ -158,10 +183,13 @@ export class RelayStore {
     afterId?: string,
     limit?: number,
     mention?: string,
-    sender?: string
+    sender?: string,
+    threadId?: string
   ): Promise<ReadResult> {
     const effectiveLimit = limit ?? 50;
-    const streamKey = this.k(`msg:${channel}`);
+    const streamKey = threadId
+      ? this.k(`thr:${channel}:${threadId}`)
+      : this.k(`msg:${channel}`);
     let entries: StreamEntry[];
 
     if (afterId) {
@@ -176,6 +204,23 @@ export class RelayStore {
     if (hasMore) entries = entries.slice(0, effectiveLimit);
 
     let messages = entries.map((e) => parseMessage(channel, e));
+
+    // Enrich top-level messages with reply counts
+    if (!threadId) {
+      const ids = messages.map((m) => m.id);
+      if (ids.length > 0) {
+        const pipeline = this.redis.pipeline();
+        for (const mid of ids) {
+          pipeline.hget(this.k(`thrc:${channel}`), mid);
+        }
+        const counts = await pipeline.exec();
+        for (let i = 0; i < messages.length; i++) {
+          const count = counts![i][1];
+          if (count) messages[i].reply_count = parseInt(count as string, 10);
+        }
+      }
+    }
+
     if (mention) {
       messages = messages.filter((m) => m.mention === mention);
     }
@@ -185,6 +230,43 @@ export class RelayStore {
 
     const nextAfterId = messages.length > 0 ? messages[messages.length - 1].id : (afterId ?? "0");
     return { messages, next_after_id: nextAfterId, has_more: hasMore, channel };
+  }
+
+  async readThread(
+    channel: string,
+    parentId: string,
+    afterId?: string,
+    limit?: number
+  ): Promise<ThreadResult> {
+    // Get parent message from main stream
+    const raw = await this.redis.xrange(this.k(`msg:${channel}`), parentId, parentId);
+    if (!raw || raw.length === 0) {
+      throw new Error("PARENT_NOT_FOUND");
+    }
+    const parent = parseMessage(channel, raw[0] as StreamEntry);
+    const replyCount = await this.redis.hget(this.k(`thrc:${channel}`), parentId);
+    parent.reply_count = parseInt(replyCount || "0", 10);
+
+    // Get replies from thread stream
+    const effectiveLimit = limit ?? 50;
+    const threadKey = this.k(`thr:${channel}:${parentId}`);
+    let entries: StreamEntry[];
+
+    if (afterId) {
+      const result = await this.redis.xread("COUNT", effectiveLimit + 1, "STREAMS", threadKey, afterId);
+      entries = result ? (result[0][1] as StreamEntry[]) : [];
+    } else {
+      const all = await this.redis.xrange(threadKey, "-", "+", "COUNT", effectiveLimit + 1);
+      entries = all as StreamEntry[];
+    }
+
+    const hasMore = entries.length > effectiveLimit;
+    if (hasMore) entries = entries.slice(0, effectiveLimit);
+
+    const replies = entries.map((e) => parseMessage(channel, e));
+    const nextAfterId = replies.length > 0 ? replies[replies.length - 1].id : (afterId ?? "0");
+
+    return { parent, replies, next_after_id: nextAfterId, has_more: hasMore };
   }
 
   async ackMessages(channel: string, sender: string, lastReadId: string): Promise<Ack> {
@@ -288,5 +370,37 @@ export class RelayStore {
     const changes = entries.map((e) => parseStatusChange(channel, e));
     const nextAfterId = changes.length > 0 ? changes[changes.length - 1].id : (afterId ?? "0");
     return { changes, next_after_id: nextAfterId, has_more: hasMore };
+  }
+
+  // ---- SSE support ----
+
+  /**
+   * Blocking read for SSE. Uses a dedicated Redis connection to XREAD BLOCK
+   * without blocking the main connection. Returns new entries or [] on timeout.
+   */
+  async blockingRead(
+    channel: string,
+    afterId: string,
+    timeoutMs: number,
+    subscriber: Redis
+  ): Promise<Message[]> {
+    const streamKey = this.k(`msg:${channel}`);
+    const result = await subscriber.xread(
+      "COUNT", 100, "BLOCK", timeoutMs, "STREAMS", streamKey, afterId
+    );
+    if (!result) return [];
+    const entries = result[0][1] as StreamEntry[];
+    const messages = entries.map((e) => parseMessage(channel, e));
+    // Enrich with reply counts
+    if (messages.length > 0) {
+      const pipeline = this.redis.pipeline();
+      for (const m of messages) pipeline.hget(this.k(`thrc:${channel}`), m.id);
+      const counts = await pipeline.exec();
+      for (let i = 0; i < messages.length; i++) {
+        const count = counts![i][1];
+        if (count) messages[i].reply_count = parseInt(count as string, 10);
+      }
+    }
+    return messages;
   }
 }

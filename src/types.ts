@@ -27,6 +27,8 @@ export interface Message {
   sender: string;
   content: string;
   mention: string | null;
+  thread_id: string | null;
+  reply_count: number;
   created_at: string;
 }
 
@@ -90,6 +92,14 @@ export interface CreateChannelRequest {
 export interface PostMessageRequest {
   content: string;
   mention?: string;
+  thread_id?: string;
+}
+
+export interface ThreadResult {
+  parent: Message;
+  replies: Message[];
+  next_after_id: string;
+  has_more: boolean;
 }
 
 export interface ReadMessagesQuery {

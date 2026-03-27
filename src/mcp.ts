@@ -27,6 +27,7 @@ async function api(method: string, path: string, body?: unknown): Promise<unknow
     const text = await res.text();
     throw new Error(`API error ${res.status}: ${text}`);
   }
+  if (res.status === 204) return { ok: true };
   return res.json();
 }
 
@@ -39,7 +40,7 @@ function err(e: unknown) {
   return { content: [{ type: "text" as const, text: `Error: ${message}` }] };
 }
 
-const server = new McpServer({ name: "agent-relay", version: "0.3.0" });
+const server = new McpServer({ name: "agent-relay", version: "0.4.0" });
 
 server.registerTool(
   "create_channel",
@@ -90,11 +91,13 @@ server.registerTool(
     description:
       "Post a message to a channel. The channel is auto-created if it doesn't exist. " +
       "Use 'mention' to flag a specific recipient (e.g. another agent's sender name) — recipients can filter by mention when reading. " +
+      "Use 'thread_id' to reply to a specific message, creating a threaded conversation. " +
       "Your sender identity is derived from your API key on the server side.",
     inputSchema: {
       channel: z.string().describe("Channel name to post to"),
       content: z.string().describe("Message content"),
       mention: z.string().optional().describe("Sender name of the agent this message is directed at"),
+      thread_id: z.string().optional().describe("Message ID to reply to (creates a thread). Get this from a read_messages response."),
     },
   },
   async (input) => {
@@ -102,6 +105,7 @@ server.registerTool(
       const result = await api("POST", `/api/channels/${encodeURIComponent(input.channel)}/messages`, {
         content: input.content,
         mention: input.mention,
+        thread_id: input.thread_id,
       });
       return ok(result);
     } catch (e) {
@@ -119,6 +123,7 @@ server.registerTool(
       "Omit after_id to get the most recent messages. " +
       "Use 'mention' to filter for messages directed at a specific agent. " +
       "Use 'sender' to filter by who sent the message. " +
+      "Messages include thread_id (if a reply) and reply_count (number of threaded replies). " +
       "Default limit is 50; maximum is 100.",
     inputSchema: {
       channel: z.string().describe("Channel name to read from"),
@@ -137,6 +142,37 @@ server.registerTool(
       if (input.sender) params.set("sender", input.sender);
       const qs = params.size > 0 ? `?${params}` : "";
       const result = await api("GET", `/api/channels/${encodeURIComponent(input.channel)}/messages${qs}`);
+      return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
+  "read_thread",
+  {
+    description:
+      "Read a message thread — the parent message and all its replies. " +
+      "Returns the parent message with reply_count and a paginated list of replies. " +
+      "Use after_id for pagination through long threads.",
+    inputSchema: {
+      channel: z.string().describe("Channel name"),
+      thread_id: z.string().describe("The message ID of the thread parent (from a read_messages response)"),
+      after_id: z.string().optional().describe("Cursor for paginating through replies"),
+      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of replies to return (default 50)"),
+    },
+  },
+  async (input) => {
+    try {
+      const params = new URLSearchParams();
+      if (input.after_id) params.set("after_id", input.after_id);
+      if (input.limit !== undefined) params.set("limit", String(input.limit));
+      const qs = params.size > 0 ? `?${params}` : "";
+      const result = await api(
+        "GET",
+        `/api/channels/${encodeURIComponent(input.channel)}/threads/${encodeURIComponent(input.thread_id)}${qs}`
+      );
       return ok(result);
     } catch (e) {
       return err(e);
@@ -205,7 +241,7 @@ server.registerTool(
   },
   async (input) => {
     try {
-      const result = await api("POST", `/api/channels/${encodeURIComponent(input.channel)}/status`, {
+      const result = await api("PUT", `/api/channels/${encodeURIComponent(input.channel)}/status`, {
         key: input.key,
         value: input.value,
       });
@@ -291,15 +327,8 @@ server.registerTool(
   },
   async (input) => {
     try {
-      const url = `${API_URL}/api/channels/${encodeURIComponent(input.channel)}`;
-      const res = await fetch(url, {
-        method: "DELETE",
-        headers: { "Authorization": `Bearer ${API_KEY}` },
-      });
-      if (res.status === 204) return ok({ deleted: true, channel: input.channel });
-      if (res.status === 404) return ok({ deleted: false, error: "Channel not found" });
-      const text = await res.text();
-      throw new Error(`API error ${res.status}: ${text}`);
+      const result = await api("DELETE", `/api/channels/${encodeURIComponent(input.channel)}`);
+      return ok(result);
     } catch (e) {
       return err(e);
     }
@@ -318,15 +347,11 @@ server.registerTool(
   },
   async (input) => {
     try {
-      const url = `${API_URL}/api/channels/${encodeURIComponent(input.channel)}/messages/${encodeURIComponent(input.message_id)}`;
-      const res = await fetch(url, {
-        method: "DELETE",
-        headers: { "Authorization": `Bearer ${API_KEY}` },
-      });
-      if (res.status === 204) return ok({ deleted: true, message_id: input.message_id });
-      if (res.status === 404) return ok({ deleted: false, error: "Message not found" });
-      const text = await res.text();
-      throw new Error(`API error ${res.status}: ${text}`);
+      const result = await api(
+        "DELETE",
+        `/api/channels/${encodeURIComponent(input.channel)}/messages/${encodeURIComponent(input.message_id)}`
+      );
+      return ok(result);
     } catch (e) {
       return err(e);
     }

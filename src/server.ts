@@ -49,16 +49,18 @@ app.get("/readyz", async (_req: Request, res: Response) => {
 app.get("/api", (_req: Request, res: Response) => {
   res.json({
     name: "agent-relay",
-    version: "0.3.0",
+    version: "0.4.0",
     endpoints: [
       { method: "POST", path: "/api/signup", description: "Create a team and get an API key", auth: false },
       { method: "POST", path: "/api/keys", description: "Create an additional API key for the team" },
       { method: "GET", path: "/api/channels", description: "List all channels" },
       { method: "POST", path: "/api/channels", description: "Create a channel" },
       { method: "DELETE", path: "/api/channels/:channel", description: "Delete a channel and all its data" },
-      { method: "GET", path: "/api/channels/:channel/messages", description: "Read messages (query: after_id, limit, mention, sender)" },
-      { method: "POST", path: "/api/channels/:channel/messages", description: "Post a message" },
+      { method: "GET", path: "/api/channels/:channel/messages", description: "Read messages (query: after_id, limit, mention, sender, thread_id)" },
+      { method: "POST", path: "/api/channels/:channel/messages", description: "Post a message (body: content, mention?, thread_id?)" },
       { method: "DELETE", path: "/api/channels/:channel/messages/:id", description: "Delete a message" },
+      { method: "GET", path: "/api/channels/:channel/threads/:id", description: "Read a thread (parent + replies, query: after_id, limit)" },
+      { method: "GET", path: "/api/channels/:channel/stream", description: "SSE stream of new messages (query: token, last_event_id)" },
       { method: "POST", path: "/api/channels/:channel/ack", description: "Acknowledge messages" },
       { method: "GET", path: "/api/channels/:channel/acks", description: "Get ack state for all agents" },
       { method: "GET", path: "/api/channels/:channel/status", description: "Get status entries (query: key)" },
@@ -185,14 +187,18 @@ app.delete("/api/channels/:channel", async (req: Request, res: Response): Promis
 // POST /api/channels/:channel/messages
 app.post("/api/channels/:channel/messages", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { content, mention } = req.body as { content?: string; mention?: string };
+    const { content, mention, thread_id } = req.body as { content?: string; mention?: string; thread_id?: string };
     if (!content) {
       apiError(res, 400, "MISSING_FIELDS", "content is required");
       return;
     }
+    if (thread_id && !isValidCursor(thread_id)) {
+      apiError(res, 400, "INVALID_CURSOR", "Invalid thread_id format. Expected a message ID like '1234567890-0'");
+      return;
+    }
     const store = new RelayStore(redis, req.apiKey!.team_id);
     const ch = req.params.channel as string;
-    const message = await store.postMessage(ch, req.apiKey!.sender, content, mention);
+    const message = await store.postMessage(ch, req.apiKey!.sender, content, mention, thread_id);
     res.status(201).json(message);
   } catch (err) {
     console.error("POST /api/channels/:channel/messages error:", err);
@@ -203,14 +209,19 @@ app.post("/api/channels/:channel/messages", async (req: Request, res: Response):
 // GET /api/channels/:channel/messages
 app.get("/api/channels/:channel/messages", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { after_id, limit, mention, sender } = req.query as {
+    const { after_id, limit, mention, sender, thread_id } = req.query as {
       after_id?: string;
       limit?: string;
       mention?: string;
       sender?: string;
+      thread_id?: string;
     };
     if (after_id && !isValidCursor(after_id)) {
       apiError(res, 400, "INVALID_CURSOR", "Invalid after_id format. Expected a stream ID like '1234567890-0'");
+      return;
+    }
+    if (thread_id && !isValidCursor(thread_id)) {
+      apiError(res, 400, "INVALID_CURSOR", "Invalid thread_id format");
       return;
     }
     const parsedLimit = limit !== undefined ? parseInt(limit, 10) : undefined;
@@ -220,10 +231,41 @@ app.get("/api/channels/:channel/messages", async (req: Request, res: Response): 
     }
     const store = new RelayStore(redis, req.apiKey!.team_id);
     const ch = req.params.channel as string;
-    const result = await store.readMessages(ch, after_id, parsedLimit, mention, sender);
+    const result = await store.readMessages(ch, after_id, parsedLimit, mention, sender, thread_id);
     res.json(result);
   } catch (err) {
     console.error("GET /api/channels/:channel/messages error:", err);
+    apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
+  }
+});
+
+// GET /api/channels/:channel/threads/:id
+app.get("/api/channels/:channel/threads/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const parentId = req.params.id as string;
+    if (!isValidCursor(parentId)) {
+      apiError(res, 400, "INVALID_CURSOR", "Invalid thread ID format");
+      return;
+    }
+    const { after_id, limit } = req.query as { after_id?: string; limit?: string };
+    if (after_id && !isValidCursor(after_id)) {
+      apiError(res, 400, "INVALID_CURSOR", "Invalid after_id format");
+      return;
+    }
+    const parsedLimit = limit !== undefined ? parseInt(limit, 10) : undefined;
+    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100)) {
+      apiError(res, 400, "INVALID_LIMIT", "limit must be an integer between 1 and 100");
+      return;
+    }
+    const store = new RelayStore(redis, req.apiKey!.team_id);
+    const result = await store.readThread(req.params.channel as string, parentId, after_id, parsedLimit);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof Error && err.message === "PARENT_NOT_FOUND") {
+      apiError(res, 404, "MESSAGE_NOT_FOUND", "Parent message not found");
+      return;
+    }
+    console.error("GET /api/channels/:channel/threads/:id error:", err);
     apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
   }
 });
@@ -247,6 +289,105 @@ app.delete("/api/channels/:channel/messages/:id", async (req: Request, res: Resp
     console.error("DELETE /api/channels/:channel/messages/:id error:", err);
     apiError(res, 500, "INTERNAL_ERROR", "Internal server error");
   }
+});
+
+// ---- SSE: GET /api/channels/:channel/stream ----
+// Auth via ?token= query param since EventSource can't set headers
+app.get("/api/channels/:channel/stream", async (req: Request, res: Response): Promise<void> => {
+  const token = req.query.token as string | undefined;
+  const headerKey = req.apiKey?.key;
+
+  const key = token || headerKey;
+  if (!key) {
+    apiError(res, 401, "MISSING_API_KEY", "Missing API key. Pass ?token=<api_key> for SSE connections");
+    return;
+  }
+
+  const apiKey = headerKey ? req.apiKey! : await validateApiKey(redis, key);
+  if (!apiKey) {
+    apiError(res, 401, "INVALID_API_KEY", "Invalid API key");
+    return;
+  }
+
+  const channel = req.params.channel as string;
+  const lastEventId = (req.headers["last-event-id"] as string) || (req.query.last_event_id as string) || "$";
+
+  // Set up SSE headers
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(":ok\n\n");
+
+  // Dedicated Redis connection for blocking reads
+  const subscriber = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: null });
+  await subscriber.connect();
+
+  const store = new RelayStore(redis, apiKey.team_id);
+  let cursor = lastEventId === "$" ? "$" : lastEventId;
+  let closed = false;
+
+  // If reconnecting with a cursor, first send any messages we missed
+  if (cursor !== "$") {
+    try {
+      const catchUp = await store.readMessages(channel, cursor, 100);
+      for (const msg of catchUp.messages) {
+        if (closed) break;
+        res.write(`id: ${msg.id}\nevent: message\ndata: ${JSON.stringify(msg)}\n\n`);
+        cursor = msg.id;
+      }
+    } catch {
+      // Channel may not exist yet, that's fine
+    }
+  }
+
+  // Get the latest ID if starting fresh
+  if (cursor === "$") {
+    const streamKey = `t:${apiKey.team_id}:msg:${channel}`;
+    const info = await redis.xinfo("STREAM", streamKey).catch(() => null);
+    if (info) {
+      const infoMap = info as string[];
+      for (let i = 0; i < infoMap.length; i += 2) {
+        if (infoMap[i] === "last-generated-id") {
+          cursor = infoMap[i + 1] as string;
+          break;
+        }
+      }
+    }
+    if (cursor === "$") cursor = "0";
+  }
+
+  const poll = async () => {
+    while (!closed) {
+      try {
+        const messages = await store.blockingRead(channel, cursor, 30000, subscriber);
+        for (const msg of messages) {
+          if (closed) break;
+          res.write(`id: ${msg.id}\nevent: message\ndata: ${JSON.stringify(msg)}\n\n`);
+          cursor = msg.id;
+        }
+        // Send keepalive comment every cycle even if no messages
+        if (!closed && messages.length === 0) {
+          res.write(":keepalive\n\n");
+        }
+      } catch (err) {
+        if (!closed) {
+          console.error("SSE poll error:", err);
+          res.write(`event: error\ndata: ${JSON.stringify({ error: "Stream error" })}\n\n`);
+        }
+        break;
+      }
+    }
+  };
+
+  req.on("close", () => {
+    closed = true;
+    subscriber.disconnect();
+  });
+
+  poll();
 });
 
 // POST /api/channels/:channel/ack
