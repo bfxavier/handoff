@@ -67,6 +67,12 @@ func (w *jsonNotFoundWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+func (w *jsonNotFoundWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ---- JSON helpers ----
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
