@@ -8,10 +8,20 @@ export { type Channel, type Message, type ReadResult, type Status, type StatusCh
 type StreamEntry = [id: string, fields: string[]];
 
 const CURSOR_RE = /^\d+-\d+$/;
+const CHANNEL_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+const MAX_CONTENT_LENGTH = 32_768;
+const MAX_STATUS_KEY_LENGTH = 256;
+const MAX_STATUS_VALUE_LENGTH = 32_768;
 
 export function isValidCursor(id: string): boolean {
   return CURSOR_RE.test(id);
 }
+
+export function isValidChannelName(name: string): boolean {
+  return CHANNEL_NAME_RE.test(name);
+}
+
+export { MAX_CONTENT_LENGTH, MAX_STATUS_KEY_LENGTH, MAX_STATUS_VALUE_LENGTH };
 
 function fieldsToMap(fields: string[]): Record<string, string> {
   const map: Record<string, string> = {};
@@ -122,7 +132,10 @@ export class RelayStore {
     pipeline.del(this.k(`acks:${name}`));
     pipeline.del(this.k(`status:${name}`));
     pipeline.del(this.k(`slog:${name}`));
-    // Thread reply streams are keyed as thr:{channel}:{parentId} — scan and delete
+    pipeline.del(this.k(`thrc:${name}`));
+    await pipeline.exec();
+
+    // Thread reply streams — scan and delete
     const pattern = this.k(`thr:${name}:*`);
     let cursor = "0";
     do {
@@ -132,8 +145,13 @@ export class RelayStore {
         await this.redis.del(...keys);
       }
     } while (cursor !== "0");
-    await pipeline.exec();
+
     return true;
+  }
+
+  async messageExists(channel: string, messageId: string): Promise<boolean> {
+    const result = await this.redis.xrange(this.k(`msg:${channel}`), messageId, messageId);
+    return result.length > 0;
   }
 
   async postMessage(
@@ -228,7 +246,7 @@ export class RelayStore {
       messages = messages.filter((m) => m.sender === sender);
     }
 
-    const nextAfterId = messages.length > 0 ? messages[messages.length - 1].id : (afterId ?? "0");
+    const nextAfterId = messages.length > 0 ? messages[messages.length - 1].id : (afterId ?? "0-0");
     return { messages, next_after_id: nextAfterId, has_more: hasMore, channel };
   }
 
@@ -264,7 +282,7 @@ export class RelayStore {
     if (hasMore) entries = entries.slice(0, effectiveLimit);
 
     const replies = entries.map((e) => parseMessage(channel, e));
-    const nextAfterId = replies.length > 0 ? replies[replies.length - 1].id : (afterId ?? "0");
+    const nextAfterId = replies.length > 0 ? replies[replies.length - 1].id : (afterId ?? "0-0");
 
     return { parent, replies, next_after_id: nextAfterId, has_more: hasMore };
   }
@@ -368,16 +386,12 @@ export class RelayStore {
     if (hasMore) entries = entries.slice(0, effectiveLimit);
 
     const changes = entries.map((e) => parseStatusChange(channel, e));
-    const nextAfterId = changes.length > 0 ? changes[changes.length - 1].id : (afterId ?? "0");
+    const nextAfterId = changes.length > 0 ? changes[changes.length - 1].id : (afterId ?? "0-0");
     return { changes, next_after_id: nextAfterId, has_more: hasMore };
   }
 
   // ---- SSE support ----
 
-  /**
-   * Blocking read for SSE. Uses a dedicated Redis connection to XREAD BLOCK
-   * without blocking the main connection. Returns new entries or [] on timeout.
-   */
   async blockingRead(
     channel: string,
     afterId: string,
@@ -391,7 +405,6 @@ export class RelayStore {
     if (!result) return [];
     const entries = result[0][1] as StreamEntry[];
     const messages = entries.map((e) => parseMessage(channel, e));
-    // Enrich with reply counts
     if (messages.length > 0) {
       const pipeline = this.redis.pipeline();
       for (const m of messages) pipeline.hget(this.k(`thrc:${channel}`), m.id);
@@ -402,5 +415,17 @@ export class RelayStore {
       }
     }
     return messages;
+  }
+
+  // ---- Rate limiting ----
+
+  async checkRateLimit(key: string, maxRequests: number, windowMs: number): Promise<{ allowed: boolean; remaining: number }> {
+    const now = Date.now();
+    const windowKey = `rl:${key}:${Math.floor(now / windowMs)}`;
+    const count = await this.redis.incr(windowKey);
+    if (count === 1) {
+      await this.redis.pexpire(windowKey, windowMs);
+    }
+    return { allowed: count <= maxRequests, remaining: Math.max(0, maxRequests - count) };
   }
 }
