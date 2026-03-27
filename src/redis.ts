@@ -7,6 +7,12 @@ export { type Channel, type Message, type ReadResult, type Status, type StatusCh
 
 type StreamEntry = [id: string, fields: string[]];
 
+const CURSOR_RE = /^\d+-\d+$/;
+
+export function isValidCursor(id: string): boolean {
+  return CURSOR_RE.test(id);
+}
+
 function fieldsToMap(fields: string[]): Record<string, string> {
   const map: Record<string, string> = {};
   for (let i = 0; i < fields.length; i += 2) {
@@ -66,19 +72,24 @@ export class RelayStore {
     }
   }
 
-  async createChannel(name: string, description?: string): Promise<Channel> {
-    await this.redis.sadd(this.k("channels"), name);
+  async channelExists(name: string): Promise<boolean> {
+    return (await this.redis.sismember(this.k("channels"), name)) === 1;
+  }
+
+  async createChannel(name: string, description?: string): Promise<{ channel: Channel; created: boolean }> {
+    const added = await this.redis.sadd(this.k("channels"), name);
     const key = this.k(`ch:${name}`);
     await this.redis.hsetnx(key, "created_at", new Date().toISOString());
     if (description) {
       await this.redis.hset(key, "description", description);
     }
     const info = await this.redis.hgetall(key);
-    return {
+    const channel: Channel = {
       name,
       description: info.description || null,
       created_at: info.created_at || new Date().toISOString(),
     };
+    return { channel, created: added === 1 };
   }
 
   async listChannels(): Promise<Channel[]> {
@@ -97,6 +108,20 @@ export class RelayStore {
         created_at: info.created_at || "",
       };
     });
+  }
+
+  async deleteChannel(name: string): Promise<boolean> {
+    const removed = await this.redis.srem(this.k("channels"), name);
+    if (!removed) return false;
+
+    const pipeline = this.redis.pipeline();
+    pipeline.del(this.k(`ch:${name}`));
+    pipeline.del(this.k(`msg:${name}`));
+    pipeline.del(this.k(`acks:${name}`));
+    pipeline.del(this.k(`status:${name}`));
+    pipeline.del(this.k(`slog:${name}`));
+    await pipeline.exec();
+    return true;
   }
 
   async postMessage(
@@ -123,31 +148,43 @@ export class RelayStore {
     };
   }
 
+  async deleteMessage(channel: string, messageId: string): Promise<boolean> {
+    const removed = await this.redis.xdel(this.k(`msg:${channel}`), messageId);
+    return removed > 0;
+  }
+
   async readMessages(
     channel: string,
     afterId?: string,
     limit?: number,
-    mention?: string
+    mention?: string,
+    sender?: string
   ): Promise<ReadResult> {
     const effectiveLimit = limit ?? 50;
     const streamKey = this.k(`msg:${channel}`);
     let entries: StreamEntry[];
 
     if (afterId) {
-      const result = await this.redis.xread("COUNT", effectiveLimit, "STREAMS", streamKey, afterId);
+      const result = await this.redis.xread("COUNT", effectiveLimit + 1, "STREAMS", streamKey, afterId);
       entries = result ? (result[0][1] as StreamEntry[]) : [];
     } else {
-      const raw = await this.redis.xrevrange(streamKey, "+", "-", "COUNT", effectiveLimit);
+      const raw = await this.redis.xrevrange(streamKey, "+", "-", "COUNT", effectiveLimit + 1);
       entries = (raw as StreamEntry[]).reverse();
     }
+
+    const hasMore = entries.length > effectiveLimit;
+    if (hasMore) entries = entries.slice(0, effectiveLimit);
 
     let messages = entries.map((e) => parseMessage(channel, e));
     if (mention) {
       messages = messages.filter((m) => m.mention === mention);
     }
+    if (sender) {
+      messages = messages.filter((m) => m.sender === sender);
+    }
 
     const nextAfterId = messages.length > 0 ? messages[messages.length - 1].id : (afterId ?? "0");
-    return { messages, next_after_id: nextAfterId, channel };
+    return { messages, next_after_id: nextAfterId, has_more: hasMore, channel };
   }
 
   async ackMessages(channel: string, sender: string, lastReadId: string): Promise<Ack> {
@@ -232,21 +269,24 @@ export class RelayStore {
     channel: string,
     afterId?: string,
     limit?: number
-  ): Promise<{ changes: StatusChange[]; next_after_id: string }> {
+  ): Promise<{ changes: StatusChange[]; next_after_id: string; has_more: boolean }> {
     const effectiveLimit = limit ?? 50;
     const logKey = this.k(`slog:${channel}`);
     let entries: StreamEntry[];
 
     if (afterId) {
-      const result = await this.redis.xread("COUNT", effectiveLimit, "STREAMS", logKey, afterId);
+      const result = await this.redis.xread("COUNT", effectiveLimit + 1, "STREAMS", logKey, afterId);
       entries = result ? (result[0][1] as StreamEntry[]) : [];
     } else {
-      const raw = await this.redis.xrevrange(logKey, "+", "-", "COUNT", effectiveLimit);
+      const raw = await this.redis.xrevrange(logKey, "+", "-", "COUNT", effectiveLimit + 1);
       entries = (raw as StreamEntry[]).reverse();
     }
 
+    const hasMore = entries.length > effectiveLimit;
+    if (hasMore) entries = entries.slice(0, effectiveLimit);
+
     const changes = entries.map((e) => parseStatusChange(channel, e));
     const nextAfterId = changes.length > 0 ? changes[changes.length - 1].id : (afterId ?? "0");
-    return { changes, next_after_id: nextAfterId };
+    return { changes, next_after_id: nextAfterId, has_more: hasMore };
   }
 }

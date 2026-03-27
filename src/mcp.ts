@@ -114,16 +114,18 @@ server.registerTool(
   "read_messages",
   {
     description:
-      "Read messages from a channel. Returns a cursor (next_after_id) for efficient polling — " +
+      "Read messages from a channel. Returns a cursor (next_after_id) and has_more flag for efficient polling — " +
       "pass the returned next_after_id as after_id on the next call to receive only new messages. " +
       "Omit after_id to get the most recent messages. " +
       "Use 'mention' to filter for messages directed at a specific agent. " +
+      "Use 'sender' to filter by who sent the message. " +
       "Default limit is 50; maximum is 100.",
     inputSchema: {
       channel: z.string().describe("Channel name to read from"),
       after_id: z.string().optional().describe("Cursor from a previous read_messages call; returns only messages after this ID"),
       limit: z.number().int().min(1).max(100).optional().describe("Maximum number of messages to return (default 50)"),
       mention: z.string().optional().describe("Filter messages to only those mentioning this sender name"),
+      sender: z.string().optional().describe("Filter messages to only those sent by this sender name"),
     },
   },
   async (input) => {
@@ -132,6 +134,7 @@ server.registerTool(
       if (input.after_id) params.set("after_id", input.after_id);
       if (input.limit !== undefined) params.set("limit", String(input.limit));
       if (input.mention) params.set("mention", input.mention);
+      if (input.sender) params.set("sender", input.sender);
       const qs = params.size > 0 ? `?${params}` : "";
       const result = await api("GET", `/api/channels/${encodeURIComponent(input.channel)}/messages${qs}`);
       return ok(result);
@@ -271,6 +274,59 @@ server.registerTool(
         `/api/channels/${encodeURIComponent(input.channel)}/status/changes${qs}`
       );
       return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
+  "delete_channel",
+  {
+    description:
+      "Delete a channel and all its data (messages, acks, status, status log). This is irreversible.",
+    inputSchema: {
+      channel: z.string().describe("Channel name to delete"),
+    },
+  },
+  async (input) => {
+    try {
+      const url = `${API_URL}/api/channels/${encodeURIComponent(input.channel)}`;
+      const res = await fetch(url, {
+        method: "DELETE",
+        headers: { "Authorization": `Bearer ${API_KEY}` },
+      });
+      if (res.status === 204) return ok({ deleted: true, channel: input.channel });
+      if (res.status === 404) return ok({ deleted: false, error: "Channel not found" });
+      const text = await res.text();
+      throw new Error(`API error ${res.status}: ${text}`);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
+  "delete_message",
+  {
+    description:
+      "Delete a specific message by its ID from a channel. This is irreversible.",
+    inputSchema: {
+      channel: z.string().describe("Channel name"),
+      message_id: z.string().describe("The message ID to delete (from a read_messages response)"),
+    },
+  },
+  async (input) => {
+    try {
+      const url = `${API_URL}/api/channels/${encodeURIComponent(input.channel)}/messages/${encodeURIComponent(input.message_id)}`;
+      const res = await fetch(url, {
+        method: "DELETE",
+        headers: { "Authorization": `Bearer ${API_KEY}` },
+      });
+      if (res.status === 204) return ok({ deleted: true, message_id: input.message_id });
+      if (res.status === 404) return ok({ deleted: false, error: "Message not found" });
+      const text = await res.text();
+      throw new Error(`API error ${res.status}: ${text}`);
     } catch (e) {
       return err(e);
     }

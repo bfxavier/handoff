@@ -33,6 +33,7 @@ export interface Message {
 export interface ReadResult {
   messages: Message[];
   next_after_id: string;
+  has_more: boolean;
   channel: string;
 }
 
@@ -95,6 +96,7 @@ export interface ReadMessagesQuery {
   after_id?: string;
   limit?: number;
   mention?: string;
+  sender?: string;
 }
 
 export interface AckRequest {
