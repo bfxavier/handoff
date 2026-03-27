@@ -382,7 +382,11 @@ app.get("/api/channels/:channel/stream", async (req: Request, res: Response): Pr
     "X-Accel-Buffering": "no",
   });
   res.flushHeaders();
-  res.write(":ok\n\n");
+
+  // Send a padded initial comment to push through any reverse proxy buffer (Traefik, nginx, etc.)
+  // Traefik buffers small responses; a 2KB+ initial payload forces it to start streaming.
+  const padding = `:${"_".repeat(2048)}\n`;
+  res.write(`${padding}:ok\n\n`);
 
   // Dedicated Redis connection for blocking reads
   const subscriber = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: null });
