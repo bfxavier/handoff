@@ -371,10 +371,13 @@ app.get("/api/channels/:channel/stream", async (req: Request, res: Response): Pr
     return;
   }
 
-  // Set SSE headers — use res.set + res.flushHeaders to ensure Express sends immediately
+  // Disable Nagle's algorithm so writes flush immediately
+  req.socket.setNoDelay(true);
+
+  // Set SSE headers
   res.set({
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
@@ -384,6 +387,15 @@ app.get("/api/channels/:channel/stream", async (req: Request, res: Response): Pr
   // Dedicated Redis connection for blocking reads
   const subscriber = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: null });
   await subscriber.connect();
+
+  // Helper: write SSE data and force flush through any buffering
+  const sseWrite = (data: string) => {
+    res.write(data);
+    // Force flush through Node's internal buffer
+    if (typeof (res as any).flush === "function") {
+      (res as any).flush();
+    }
+  };
 
   const store = new RelayStore(redis, apiKey.team_id);
   let cursor = lastEventId === "$" ? "$" : lastEventId;
@@ -395,7 +407,7 @@ app.get("/api/channels/:channel/stream", async (req: Request, res: Response): Pr
       const catchUp = await store.readMessages(channel, cursor, 100);
       for (const msg of catchUp.messages) {
         if (closed) break;
-        res.write(`id: ${msg.id}\nevent: message\ndata: ${JSON.stringify(msg)}\n\n`);
+        sseWrite(`id: ${msg.id}\nevent: message\ndata: ${JSON.stringify(msg)}\n\n`);
         cursor = msg.id;
       }
     } catch {
@@ -425,16 +437,16 @@ app.get("/api/channels/:channel/stream", async (req: Request, res: Response): Pr
         const messages = await store.blockingRead(channel, cursor, 25000, subscriber);
         for (const msg of messages) {
           if (closed) break;
-          res.write(`id: ${msg.id}\nevent: message\ndata: ${JSON.stringify(msg)}\n\n`);
+          sseWrite(`id: ${msg.id}\nevent: message\ndata: ${JSON.stringify(msg)}\n\n`);
           cursor = msg.id;
         }
         if (!closed && messages.length === 0) {
-          res.write(":keepalive\n\n");
+          sseWrite(":keepalive\n\n");
         }
       } catch (err) {
         if (!closed) {
           console.error("SSE poll error:", err);
-          res.write(`event: error\ndata: ${JSON.stringify({ error: "Stream error" })}\n\n`);
+          sseWrite(`event: error\ndata: ${JSON.stringify({ error: "Stream error" })}\n\n`);
         }
         break;
       }
