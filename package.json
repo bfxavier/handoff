@@ -1,0 +1,27 @@
+{
+  "name": "agent-relay",
+  "version": "0.3.0",
+  "description": "Agent-to-agent coordination relay — MCP server + hosted API",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "mcp": "node dist/mcp.js"
+  },
+  "bin": {
+    "agent-relay-mcp": "dist/mcp.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "ioredis": "^5.6.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

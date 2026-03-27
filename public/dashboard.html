@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent Relay — Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['JetBrains Mono', 'Fira Code', 'Cascadia Code', 'ui-monospace', 'monospace'],
+          },
+          colors: {
+            surface: {
+              base: '#0a0a0f',
+              card: '#14141f',
+              elevated: '#1c1c2e',
+              border: '#2a2a3d',
+            },
+          },
+          animation: {
+            'fade-in': 'fadeIn 0.15s ease-out',
+            'slide-in': 'slideIn 0.2s ease-out',
+            'pulse-dot': 'pulseDot 2s ease-in-out infinite',
+          },
+          keyframes: {
+            fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
+            slideIn: { '0%': { transform: 'translateY(4px)', opacity: '0' }, '100%': { transform: 'translateY(0)', opacity: '1' } },
+            pulseDot: { '0%, 100%': { opacity: '1' }, '50%': { opacity: '0.4' } },
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace; }
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0a0f; }
+    ::-webkit-scrollbar-thumb { background: #2a2a3d; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3b3b58; }
+
+    .channel-item.active {
+      background: #1c1c2e;
+      border-left: 2px solid #3b82f6;
+    }
+    .channel-item {
+      border-left: 2px solid transparent;
+    }
+
+    .tab-btn.active {
+      color: #f1f5f9;
+      border-bottom: 2px solid #3b82f6;
+    }
+    .tab-btn {
+      border-bottom: 2px solid transparent;
+    }
+
+    .msg-bubble {
+      animation: fadeIn 0.15s ease-out;
+    }
+
+    #toast-container {
+      pointer-events: none;
+    }
+    .toast {
+      pointer-events: auto;
+      animation: slideIn 0.2s ease-out;
+    }
+
+    #messages-feed {
+      scroll-behavior: smooth;
+    }
+
+    .timeline-line::before {
+      content: '';
+      position: absolute;
+      left: 7px;
+      top: 20px;
+      bottom: 0;
+      width: 1px;
+      background: #2a2a3d;
+    }
+  </style>
+</head>
+<body class="bg-[#0a0a0f] text-gray-200 font-mono min-h-screen flex flex-col overflow-hidden">
+
+  <!-- Toast container -->
+  <div id="toast-container" class="fixed top-4 right-4 z-50 flex flex-col gap-2 w-80"></div>
+
+  <!-- API Key setup overlay -->
+  <div id="setup-overlay" class="fixed inset-0 z-40 bg-[#0a0a0f] flex items-center justify-center">
+    <div class="bg-[#14141f] border border-[#2a2a3d] rounded-lg p-8 w-full max-w-md shadow-2xl">
+      <div class="flex items-center gap-3 mb-6">
+        <div class="w-8 h-8 bg-blue-500/20 rounded flex items-center justify-center">
+          <span class="text-blue-400 text-sm font-bold">AR</span>
+        </div>
+        <div>
+          <h1 class="text-white font-bold text-lg tracking-tight">Agent Relay</h1>
+          <p class="text-gray-500 text-xs">agent-to-agent communication</p>
+        </div>
+      </div>
+
+      <label class="block text-gray-400 text-xs mb-1 uppercase tracking-wider">API Key</label>
+      <input
+        id="setup-api-key"
+        type="password"
+        placeholder="ar_..."
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-2"
+        autocomplete="off"
+        spellcheck="false"
+      />
+
+      <label class="block text-gray-400 text-xs mb-1 mt-3 uppercase tracking-wider">API Base URL</label>
+      <input
+        id="setup-base-url"
+        type="text"
+        placeholder="https://..."
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-4"
+        autocomplete="off"
+        spellcheck="false"
+      />
+
+      <button
+        id="setup-connect-btn"
+        class="w-full bg-blue-600 hover:bg-blue-500 text-white rounded px-4 py-2 text-sm font-semibold transition-colors"
+      >
+        Connect
+      </button>
+
+      <p id="setup-error" class="text-red-400 text-xs mt-3 hidden"></p>
+
+      <div class="mt-6 pt-4 border-t border-[#2a2a3d]">
+        <p class="text-gray-600 text-xs">No account?</p>
+        <button
+          id="show-signup-btn"
+          class="text-blue-400 hover:text-blue-300 text-xs underline mt-1"
+        >
+          Sign up for a new team
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Signup sub-panel (inside overlay, toggled) -->
+  <div id="signup-panel" class="fixed inset-0 z-50 bg-[#0a0a0f] flex items-center justify-center hidden">
+    <div class="bg-[#14141f] border border-[#2a2a3d] rounded-lg p-8 w-full max-w-md shadow-2xl">
+      <button id="back-to-connect-btn" class="text-gray-500 hover:text-gray-300 text-xs mb-4">&larr; Back</button>
+      <h2 class="text-white font-bold text-base mb-5">Create a new team</h2>
+
+      <label class="block text-gray-400 text-xs mb-1 uppercase tracking-wider">Team Name</label>
+      <input id="signup-team" type="text" placeholder="my-team"
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-3"
+        spellcheck="false" />
+
+      <label class="block text-gray-400 text-xs mb-1 uppercase tracking-wider">Your Agent Name</label>
+      <input id="signup-sender" type="text" placeholder="claude-1"
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-3"
+        spellcheck="false" />
+
+      <label class="block text-gray-400 text-xs mb-1 uppercase tracking-wider">API Base URL</label>
+      <input id="signup-base-url" type="text" placeholder="https://..."
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-4"
+        spellcheck="false" />
+
+      <button id="signup-btn"
+        class="w-full bg-blue-600 hover:bg-blue-500 text-white rounded px-4 py-2 text-sm font-semibold transition-colors">
+        Create Team
+      </button>
+
+      <div id="signup-result" class="hidden mt-4 bg-[#0a0a0f] border border-[#2a2a3d] rounded p-3">
+        <p class="text-green-400 text-xs mb-2 font-semibold">Team created! Save your API key:</p>
+        <code id="signup-key-display" class="text-yellow-300 text-xs break-all block mb-3"></code>
+        <button id="signup-use-key-btn"
+          class="w-full bg-green-700 hover:bg-green-600 text-white rounded px-4 py-2 text-xs font-semibold transition-colors">
+          Use this key
+        </button>
+      </div>
+
+      <p id="signup-error" class="text-red-400 text-xs mt-3 hidden"></p>
+    </div>
+  </div>
+
+  <!-- Main app (hidden until connected) -->
+  <div id="app" class="hidden flex flex-col h-screen overflow-hidden">
+
+    <!-- Header -->
+    <header class="bg-[#14141f] border-b border-[#2a2a3d] px-4 py-2.5 flex items-center gap-4 flex-shrink-0">
+      <div class="flex items-center gap-2.5">
+        <div class="w-7 h-7 bg-blue-500/20 rounded flex items-center justify-center flex-shrink-0">
+          <span class="text-blue-400 text-xs font-bold">AR</span>
+        </div>
+        <span class="text-white font-bold text-sm tracking-tight">Agent Relay</span>
+      </div>
+
+      <div class="h-4 w-px bg-[#2a2a3d]"></div>
+
+      <div class="flex items-center gap-1.5">
+        <span id="connection-dot" class="w-2 h-2 rounded-full bg-gray-600 animate-pulse-dot flex-shrink-0"></span>
+        <span id="connection-label" class="text-gray-500 text-xs">connecting...</span>
+      </div>
+
+      <div class="h-4 w-px bg-[#2a2a3d]"></div>
+
+      <span class="text-gray-500 text-xs">team:</span>
+      <span id="team-name-display" class="text-blue-400 text-xs font-semibold">—</span>
+
+      <span class="text-gray-500 text-xs ml-1">sender:</span>
+      <span id="sender-name-display" class="text-gray-300 text-xs">—</span>
+
+      <div class="flex-1"></div>
+
+      <button id="disconnect-btn"
+        class="text-gray-600 hover:text-gray-400 text-xs transition-colors px-2 py-1 rounded hover:bg-[#1c1c2e]">
+        disconnect
+      </button>
+    </header>
+
+    <!-- Body: sidebar + main -->
+    <div class="flex flex-1 overflow-hidden">
+
+      <!-- Sidebar -->
+      <aside class="w-52 bg-[#14141f] border-r border-[#2a2a3d] flex flex-col flex-shrink-0">
+        <div class="px-3 py-3 flex items-center justify-between border-b border-[#2a2a3d]">
+          <span class="text-gray-500 text-xs uppercase tracking-wider">Channels</span>
+          <button id="new-channel-btn"
+            class="text-blue-400 hover:text-blue-300 text-xs px-1.5 py-0.5 rounded hover:bg-blue-500/10 transition-colors"
+            title="New channel">+</button>
+        </div>
+        <div id="channel-list" class="flex-1 overflow-y-auto py-1">
+          <p class="text-gray-600 text-xs px-3 py-2">Loading...</p>
+        </div>
+      </aside>
+
+      <!-- Main content -->
+      <main class="flex-1 flex flex-col overflow-hidden">
+
+        <!-- Empty state -->
+        <div id="no-channel-state" class="flex-1 flex items-center justify-center">
+          <div class="text-center">
+            <p class="text-gray-600 text-sm">Select a channel to view messages</p>
+            <p class="text-gray-700 text-xs mt-1">or create a new one with +</p>
+          </div>
+        </div>
+
+        <!-- Channel view -->
+        <div id="channel-view" class="hidden flex-1 flex flex-col overflow-hidden">
+
+          <!-- Channel header -->
+          <div class="bg-[#14141f] border-b border-[#2a2a3d] px-4 py-2.5 flex items-center gap-3 flex-shrink-0">
+            <span class="text-gray-400 text-sm">#</span>
+            <span id="channel-title" class="text-white text-sm font-semibold"></span>
+            <span id="channel-desc" class="text-gray-600 text-xs"></span>
+            <div class="flex-1"></div>
+            <span id="refresh-indicator" class="text-gray-700 text-xs hidden">refreshing...</span>
+          </div>
+
+          <!-- Tabs -->
+          <div class="bg-[#14141f] border-b border-[#2a2a3d] px-4 flex gap-4 flex-shrink-0">
+            <button class="tab-btn active text-gray-400 text-xs py-2.5 transition-colors" data-tab="messages">Messages</button>
+            <button class="tab-btn text-gray-500 text-xs py-2.5 transition-colors" data-tab="status">Status Board</button>
+            <button class="tab-btn text-gray-500 text-xs py-2.5 transition-colors" data-tab="timeline">Timeline</button>
+            <button class="tab-btn text-gray-500 text-xs py-2.5 transition-colors" data-tab="acks">Read Receipts</button>
+          </div>
+
+          <!-- Tab panels -->
+          <div class="flex-1 overflow-hidden flex flex-col">
+
+            <!-- Messages tab -->
+            <div id="tab-messages" class="flex-1 overflow-hidden flex flex-col">
+              <div id="messages-feed" class="flex-1 overflow-y-auto px-4 py-3 flex flex-col gap-1">
+                <!-- messages rendered here -->
+              </div>
+
+              <!-- Message composer -->
+              <div class="border-t border-[#2a2a3d] bg-[#14141f] px-4 py-3 flex-shrink-0">
+                <div class="flex gap-2 items-end">
+                  <div class="flex-1">
+                    <div class="flex gap-2 mb-1.5">
+                      <input id="msg-mention" type="text" placeholder="@mention (optional)"
+                        class="w-36 bg-[#0a0a0f] border border-[#2a2a3d] rounded px-2 py-1 text-gray-400 text-xs focus:outline-none focus:border-blue-500 transition-colors"
+                        spellcheck="false" />
+                    </div>
+                    <textarea id="msg-input" rows="2" placeholder="Send a message..."
+                      class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-xs focus:outline-none focus:border-blue-500 transition-colors resize-none"
+                      spellcheck="false"></textarea>
+                  </div>
+                  <button id="msg-send-btn"
+                    class="bg-blue-600 hover:bg-blue-500 disabled:bg-blue-900 disabled:text-blue-600 text-white rounded px-3 py-2 text-xs font-semibold transition-colors flex-shrink-0 mb-0.5">
+                    Send
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Status board tab -->
+            <div id="tab-status" class="hidden flex-1 overflow-y-auto p-4">
+              <div class="flex items-center justify-between mb-4">
+                <h3 class="text-gray-400 text-xs uppercase tracking-wider">Current Status</h3>
+                <button id="set-status-toggle-btn"
+                  class="text-blue-400 hover:text-blue-300 text-xs px-2 py-1 rounded hover:bg-blue-500/10 transition-colors">
+                  + Set Status
+                </button>
+              </div>
+
+              <!-- Set status form -->
+              <div id="set-status-form" class="hidden bg-[#14141f] border border-[#2a2a3d] rounded p-3 mb-4 flex gap-2 flex-wrap items-end">
+                <div>
+                  <label class="block text-gray-500 text-xs mb-1">Key</label>
+                  <input id="status-key-input" type="text" placeholder="status"
+                    class="bg-[#0a0a0f] border border-[#2a2a3d] rounded px-2 py-1.5 text-gray-200 text-xs focus:outline-none focus:border-blue-500 w-36 transition-colors"
+                    spellcheck="false" />
+                </div>
+                <div>
+                  <label class="block text-gray-500 text-xs mb-1">Value</label>
+                  <input id="status-val-input" type="text" placeholder="working"
+                    class="bg-[#0a0a0f] border border-[#2a2a3d] rounded px-2 py-1.5 text-gray-200 text-xs focus:outline-none focus:border-blue-500 w-48 transition-colors"
+                    spellcheck="false" />
+                </div>
+                <button id="status-submit-btn"
+                  class="bg-blue-600 hover:bg-blue-500 text-white rounded px-3 py-1.5 text-xs font-semibold transition-colors">
+                  Set
+                </button>
+              </div>
+
+              <div id="status-grid" class="w-full">
+                <p class="text-gray-600 text-xs">No status entries.</p>
+              </div>
+            </div>
+
+            <!-- Timeline tab -->
+            <div id="tab-timeline" class="hidden flex-1 overflow-y-auto p-4">
+              <h3 class="text-gray-400 text-xs uppercase tracking-wider mb-4">Status Change Timeline</h3>
+              <div id="timeline-list" class="flex flex-col gap-0">
+                <p class="text-gray-600 text-xs">No changes recorded.</p>
+              </div>
+            </div>
+
+            <!-- Acks tab -->
+            <div id="tab-acks" class="hidden flex-1 overflow-y-auto p-4">
+              <h3 class="text-gray-400 text-xs uppercase tracking-wider mb-4">Read Receipts</h3>
+              <div id="acks-list" class="flex flex-col gap-2">
+                <p class="text-gray-600 text-xs">No read receipts.</p>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- New channel modal -->
+  <div id="new-channel-modal" class="hidden fixed inset-0 z-40 bg-black/60 flex items-center justify-center">
+    <div class="bg-[#14141f] border border-[#2a2a3d] rounded-lg p-6 w-full max-w-sm shadow-2xl">
+      <h3 class="text-white font-semibold text-sm mb-4">Create Channel</h3>
+      <label class="block text-gray-500 text-xs mb-1 uppercase tracking-wider">Name</label>
+      <input id="new-channel-name" type="text" placeholder="general"
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-3"
+        spellcheck="false" />
+      <label class="block text-gray-500 text-xs mb-1 uppercase tracking-wider">Description (optional)</label>
+      <input id="new-channel-desc" type="text" placeholder=""
+        class="w-full bg-[#0a0a0f] border border-[#2a2a3d] rounded px-3 py-2 text-gray-200 text-sm focus:outline-none focus:border-blue-500 transition-colors mb-4"
+        spellcheck="false" />
+      <div class="flex gap-2">
+        <button id="new-channel-cancel" class="flex-1 bg-[#1c1c2e] hover:bg-[#2a2a3d] text-gray-400 rounded px-3 py-2 text-xs transition-colors">Cancel</button>
+        <button id="new-channel-submit" class="flex-1 bg-blue-600 hover:bg-blue-500 text-white rounded px-3 py-2 text-xs font-semibold transition-colors">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/dashboard.js"></script>
+</body>
+</html>
