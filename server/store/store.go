@@ -180,12 +180,13 @@ func (s *Store) CreateTeam(ctx context.Context, name, senderName string) (*Team,
 
 func (s *Store) CreateApiKey(ctx context.Context, teamID, senderName string) (string, error) {
 	key := generateApiKeyStr()
+	keyHash := hashKey(key)
 	ts := now()
-	data := ApiKey{Key: key, TeamID: teamID, Sender: senderName, CreatedAt: ts}
+	data := ApiKey{Key: keyHash, TeamID: teamID, Sender: senderName, CreatedAt: ts}
 	b, _ := json.Marshal(data)
 	pipe := s.rdb.Pipeline()
-	pipe.HSet(ctx, "auth:keys", key, string(b))
-	pipe.SAdd(ctx, "auth:team:"+teamID+":keys", key)
+	pipe.HSet(ctx, "auth:keys", keyHash, string(b))
+	pipe.SAdd(ctx, "auth:team:"+teamID+":keys", keyHash)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return "", err
 	}
@@ -193,7 +194,8 @@ func (s *Store) CreateApiKey(ctx context.Context, teamID, senderName string) (st
 }
 
 func (s *Store) ValidateApiKey(ctx context.Context, key string) (*ApiKey, error) {
-	raw, err := s.rdb.HGet(ctx, "auth:keys", key).Result()
+	keyHash := hashKey(key)
+	raw, err := s.rdb.HGet(ctx, "auth:keys", keyHash).Result()
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -209,22 +211,22 @@ func (s *Store) ValidateApiKey(ctx context.Context, key string) (*ApiKey, error)
 
 func (s *Store) ListApiKeys(ctx context.Context, teamID string) ([]ApiKey, error) {
 	// Use per-team key set for O(team_keys) instead of O(total_keys)
-	keyNames, err := s.rdb.SMembers(ctx, "auth:team:"+teamID+":keys").Result()
+	keyHashes, err := s.rdb.SMembers(ctx, "auth:team:"+teamID+":keys").Result()
 	if err != nil {
 		return nil, err
 	}
-	if len(keyNames) == 0 {
+	if len(keyHashes) == 0 {
 		return []ApiKey{}, nil
 	}
 
 	pipe := s.rdb.Pipeline()
-	cmds := make([]*redis.StringCmd, len(keyNames))
-	for i, k := range keyNames {
-		cmds[i] = pipe.HGet(ctx, "auth:keys", k)
+	cmds := make([]*redis.StringCmd, len(keyHashes))
+	for i, h := range keyHashes {
+		cmds[i] = pipe.HGet(ctx, "auth:keys", h)
 	}
 	pipe.Exec(ctx)
 
-	keys := make([]ApiKey, 0, len(keyNames))
+	keys := make([]ApiKey, 0, len(keyHashes))
 	for _, cmd := range cmds {
 		raw, err := cmd.Result()
 		if err != nil {
@@ -232,9 +234,9 @@ func (s *Store) ListApiKeys(ctx context.Context, teamID string) ([]ApiKey, error
 		}
 		var ak ApiKey
 		if json.Unmarshal([]byte(raw), &ak) == nil {
-			// Mask the key for security — show prefix + last 4 chars
+			// Key field is already the hash — show truncated hash for display
 			if len(ak.Key) > 12 {
-				ak.Key = ak.Key[:10] + "..." + ak.Key[len(ak.Key)-4:]
+				ak.Key = ak.Key[:8] + "..."
 			}
 			keys = append(keys, ak)
 		}
@@ -250,7 +252,9 @@ func (s *Store) ensureChannel(ctx context.Context, teamID, name string) error {
 		return err
 	}
 	if added > 0 {
-		s.rdb.HSetNX(ctx, s.k(teamID, "ch:"+name), "created_at", now())
+		if err := s.rdb.HSetNX(ctx, s.k(teamID, "ch:"+name), "created_at", now()).Err(); err != nil {
+			return fmt.Errorf("ensureChannel metadata: %w", err)
+		}
 	}
 	return nil
 }
@@ -261,9 +265,13 @@ func (s *Store) CreateChannel(ctx context.Context, teamID, name string, descript
 		return nil, false, err
 	}
 	key := s.k(teamID, "ch:"+name)
-	s.rdb.HSetNX(ctx, key, "created_at", now())
+	if err := s.rdb.HSetNX(ctx, key, "created_at", now()).Err(); err != nil {
+		return nil, false, err
+	}
 	if description != nil {
-		s.rdb.HSet(ctx, key, "description", *description)
+		if err := s.rdb.HSet(ctx, key, "description", *description).Err(); err != nil {
+			return nil, false, err
+		}
 	}
 	info, err := s.rdb.HGetAll(ctx, key).Result()
 	if err != nil {
@@ -947,14 +955,12 @@ func parseMessage(channel string, e redis.XMessage) Message {
 		CreatedAt: strOr(e.Values, "created_at", ""),
 	}
 	if v, ok := e.Values["mention"]; ok {
-		s := v.(string)
-		if s != "" {
+		if s, ok := v.(string); ok && s != "" {
 			m.Mention = &s
 		}
 	}
 	if v, ok := e.Values["thread_id"]; ok {
-		s := v.(string)
-		if s != "" {
+		if s, ok := v.(string); ok && s != "" {
 			m.ThreadID = &s
 		}
 	}
@@ -970,8 +976,7 @@ func parseStatusChange(channel string, e redis.XMessage) StatusChange {
 		ChangedAt: strOr(e.Values, "changed_at", ""),
 	}
 	if v, ok := e.Values["changed_by"]; ok {
-		s := v.(string)
-		if s != "" {
+		if s, ok := v.(string); ok && s != "" {
 			sc.ChangedBy = &s
 		}
 	}

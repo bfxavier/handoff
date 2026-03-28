@@ -791,7 +791,7 @@ func TestCheckRateLimitKeyNotExposed(t *testing.T) {
 
 func TestReadMessagesFilteredPagination(t *testing.T) {
 	s, ctx := setup(t)
-	teamID := "team1"
+	teamID := "filter-pagination-team"
 
 	// Post 20 messages: 10 from alice, 10 from bob, interleaved
 	for i := 0; i < 20; i++ {
@@ -809,7 +809,7 @@ func TestReadMessagesFilteredPagination(t *testing.T) {
 		t.Fatalf("ReadMessages: %v", err)
 	}
 	if len(r.Messages) != 5 {
-		t.Errorf("expected 5 alice messages, got %d", len(r.Messages))
+		t.Fatalf("expected 5 alice messages, got %d", len(r.Messages))
 	}
 	for _, m := range r.Messages {
 		if m.Sender != "alice" {
@@ -823,7 +823,7 @@ func TestReadMessagesFilteredPagination(t *testing.T) {
 		t.Fatalf("ReadMessages page 2: %v", err)
 	}
 	if len(r2.Messages) != 5 {
-		t.Errorf("expected 5 alice messages on page 2, got %d", len(r2.Messages))
+		t.Fatalf("expected 5 alice messages on page 2, got %d", len(r2.Messages))
 	}
 
 	// No overlap between pages
@@ -836,7 +836,7 @@ func TestReadMessagesFilteredPagination(t *testing.T) {
 
 func TestReadMessagesFilteredMentionPagination(t *testing.T) {
 	s, ctx := setup(t)
-	teamID := "team1"
+	teamID := "filter-mention-team"
 
 	// Post 15 messages: only 3 mention "bob"
 	bob := "bob"

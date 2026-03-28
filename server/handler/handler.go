@@ -167,20 +167,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/keys", s.auth(s.rateLimit(s.handleListKeys)))
 	s.mux.HandleFunc("GET /api/channels", s.auth(s.rateLimit(s.handleListChannels)))
 	s.mux.HandleFunc("POST /api/channels", s.auth(s.rateLimit(s.handleCreateChannel)))
-	s.mux.HandleFunc("DELETE /api/channels/{channel}", s.auth(s.rateLimit(s.handleDeleteChannel)))
-	s.mux.HandleFunc("POST /api/channels/{channel}/messages", s.auth(s.rateLimit(s.handlePostMessage)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/messages", s.auth(s.rateLimit(s.handleReadMessages)))
-	s.mux.HandleFunc("DELETE /api/channels/{channel}/messages/{id}", s.auth(s.rateLimit(s.handleDeleteMessage)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/threads/{id}", s.auth(s.rateLimit(s.handleReadThread)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/stream", s.auth(s.handleSSE))
-	s.mux.HandleFunc("POST /api/channels/{channel}/ack", s.auth(s.rateLimit(s.handleAck)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/acks", s.auth(s.rateLimit(s.handleGetAcks)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/unread", s.auth(s.rateLimit(s.handleUnread)))
-	s.mux.HandleFunc("PUT /api/channels/{channel}/status", s.auth(s.rateLimit(s.handleSetStatus)))
-	s.mux.HandleFunc("POST /api/channels/{channel}/status", s.auth(s.rateLimit(s.handleSetStatus)))
-	s.mux.HandleFunc("DELETE /api/channels/{channel}/status/{key}", s.auth(s.rateLimit(s.handleDeleteStatus)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/status", s.auth(s.rateLimit(s.handleGetStatus)))
-	s.mux.HandleFunc("GET /api/channels/{channel}/status/changes", s.auth(s.rateLimit(s.handleGetStatusChanges)))
+	s.mux.HandleFunc("DELETE /api/channels/{channel}", s.auth(s.requireValidChannel(s.rateLimit(s.handleDeleteChannel))))
+	s.mux.HandleFunc("POST /api/channels/{channel}/messages", s.auth(s.requireValidChannel(s.rateLimit(s.handlePostMessage))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/messages", s.auth(s.requireValidChannel(s.rateLimit(s.handleReadMessages))))
+	s.mux.HandleFunc("DELETE /api/channels/{channel}/messages/{id}", s.auth(s.requireValidChannel(s.rateLimit(s.handleDeleteMessage))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/threads/{id}", s.auth(s.requireValidChannel(s.rateLimit(s.handleReadThread))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/stream", s.auth(s.requireValidChannel(s.handleSSE)))
+	s.mux.HandleFunc("POST /api/channels/{channel}/ack", s.auth(s.requireValidChannel(s.rateLimit(s.handleAck))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/acks", s.auth(s.requireValidChannel(s.rateLimit(s.handleGetAcks))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/unread", s.auth(s.requireValidChannel(s.rateLimit(s.handleUnread))))
+	s.mux.HandleFunc("PUT /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.rateLimit(s.handleSetStatus))))
+	s.mux.HandleFunc("POST /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.rateLimit(s.handleSetStatus))))
+	s.mux.HandleFunc("DELETE /api/channels/{channel}/status/{key}", s.auth(s.requireValidChannel(s.rateLimit(s.handleDeleteStatus))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.rateLimit(s.handleGetStatus))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/status/changes", s.auth(s.requireValidChannel(s.rateLimit(s.handleGetStatusChanges))))
 	s.mux.HandleFunc("GET /api/status", s.auth(s.rateLimit(s.handleGetStatusCrossChannel)))
 }
 
@@ -240,6 +240,17 @@ func (s *Server) rateLimit(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 		if !allowed {
 			apiError(w, 429, "RATE_LIMITED", "Too many requests. Slow down.")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) requireValidChannel(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ch := r.PathValue("channel")
+		if ch != "" && !store.IsValidChannelName(ch) {
+			apiError(w, 400, "INVALID_CHANNEL_NAME", "Channel name must be 1-128 characters, alphanumeric with hyphens, underscores, and dots")
 			return
 		}
 		next(w, r)
