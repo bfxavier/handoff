@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -283,16 +284,27 @@ func (s *Store) ListChannels(ctx context.Context, teamID string) ([]Channel, err
 	if err != nil {
 		return nil, err
 	}
+	if len(names) == 0 {
+		return []Channel{}, nil
+	}
 	// Sort
 	sorted := make([]string, len(names))
 	copy(sorted, names)
 	sortStrings(sorted)
 
+	// Pipeline all HGetAll calls
+	pipe := s.rdb.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(sorted))
+	for i, name := range sorted {
+		cmds[i] = pipe.HGetAll(ctx, s.k(teamID, "ch:"+name))
+	}
+	pipe.Exec(ctx)
+
 	channels := make([]Channel, 0, len(sorted))
-	for _, name := range sorted {
-		info, err := s.rdb.HGetAll(ctx, s.k(teamID, "ch:"+name)).Result()
+	for i, name := range sorted {
+		info, err := cmds[i].Result()
 		if err != nil {
-			return nil, err
+			continue
 		}
 		ch := Channel{Name: name, CreatedAt: info["created_at"]}
 		if d, ok := info["description"]; ok && d != "" {
@@ -448,51 +460,104 @@ func (s *Store) ReadMessages(ctx context.Context, teamID, channel string, afterI
 		}
 	}
 
-	hasMore := len(entries) > limit
-	if hasMore {
-		entries = entries[:limit]
-	}
+	needsFilter := mention != nil || sender != nil
 
-	messages := make([]Message, 0, len(entries))
-	for _, e := range entries {
-		messages = append(messages, parseMessage(channel, e))
-	}
-
-	// Enrich with reply counts for top-level reads
-	if threadID == nil && len(messages) > 0 {
-		pipe := s.rdb.Pipeline()
-		cmds := make([]*redis.StringCmd, len(messages))
-		for i, m := range messages {
-			cmds[i] = pipe.HGet(ctx, s.k(teamID, "thrc:"+channel), m.ID)
+	// If no filters, use simple path
+	if !needsFilter {
+		hasMore := len(entries) > limit
+		if hasMore {
+			entries = entries[:limit]
 		}
-		pipe.Exec(ctx)
-		for i, cmd := range cmds {
-			if v, err := cmd.Result(); err == nil {
-				if n, err := strconv.Atoi(v); err == nil {
-					messages[i].ReplyCount = n
+
+		messages := make([]Message, 0, len(entries))
+		for _, e := range entries {
+			messages = append(messages, parseMessage(channel, e))
+		}
+
+		// Enrich with reply counts for top-level reads
+		if threadID == nil && len(messages) > 0 {
+			s.enrichReplyCounts(ctx, teamID, channel, messages)
+		}
+
+		nextAfterID := "0-0"
+		if afterID != nil {
+			nextAfterID = *afterID
+		}
+		if len(messages) > 0 {
+			nextAfterID = messages[len(messages)-1].ID
+		}
+
+		return &ReadResult{
+			Messages: messages, NextAfterID: nextAfterID, HasMore: hasMore, Channel: channel,
+		}, nil
+	}
+
+	// Scan-and-fill: keep reading until we have `limit` matching results or stream is exhausted
+	messages := make([]Message, 0, limit)
+	cursor := "("
+	if afterID != nil {
+		cursor = "(" + *afterID
+	} else {
+		cursor = "-"
+	}
+	hasMore := false
+	const batchSize = 100
+	maxScans := 10 // safety cap to avoid unbounded scanning
+
+	for scan := 0; scan < maxScans && len(messages) < limit; scan++ {
+		var batch []redis.XMessage
+		if afterID != nil || scan > 0 {
+			batch, err = s.rdb.XRangeN(ctx, streamKey, cursor, "+", int64(batchSize)).Result()
+		} else {
+			// First call without afterID: get latest messages
+			batch, err = s.rdb.XRevRangeN(ctx, streamKey, "+", "-", int64(batchSize)).Result()
+			if err == nil {
+				// Reverse to chronological order
+				for i, j := 0, len(batch)-1; i < j; i, j = i+1, j-1 {
+					batch[i], batch[j] = batch[j], batch[i]
 				}
 			}
 		}
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		for _, e := range batch {
+			m := parseMessage(channel, e)
+			if mention != nil && (m.Mention == nil || *m.Mention != *mention) {
+				continue
+			}
+			if sender != nil && m.Sender != *sender {
+				continue
+			}
+			if len(messages) < limit {
+				messages = append(messages, m)
+			} else {
+				hasMore = true
+				break
+			}
+		}
+
+		if hasMore {
+			break
+		}
+
+		// Update cursor for next batch
+		lastID := batch[len(batch)-1].ID
+		cursor = "(" + lastID
+
+		// If we got fewer than batchSize, stream is exhausted
+		if len(batch) < batchSize {
+			break
+		}
 	}
 
-	// Apply filters
-	if mention != nil {
-		filtered := messages[:0]
-		for _, m := range messages {
-			if m.Mention != nil && *m.Mention == *mention {
-				filtered = append(filtered, m)
-			}
-		}
-		messages = filtered
-	}
-	if sender != nil {
-		filtered := messages[:0]
-		for _, m := range messages {
-			if m.Sender == *sender {
-				filtered = append(filtered, m)
-			}
-		}
-		messages = filtered
+	// Enrich with reply counts
+	if threadID == nil && len(messages) > 0 {
+		s.enrichReplyCounts(ctx, teamID, channel, messages)
 	}
 
 	nextAfterID := "0-0"
@@ -801,9 +866,14 @@ func (s *Store) GetStatusChanges(ctx context.Context, teamID, channel string, af
 
 // ---- Rate Limiting ----
 
+func hashKey(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:16]) // 32-char hex prefix
+}
+
 func (s *Store) CheckRateLimit(ctx context.Context, apiKeyStr string, maxReqs int, windowMs int64) (bool, int, error) {
 	nowMs := time.Now().UnixMilli()
-	windowKey := fmt.Sprintf("rl:%s:%d", apiKeyStr, nowMs/windowMs)
+	windowKey := fmt.Sprintf("rl:%s:%d", hashKey(apiKeyStr), nowMs/windowMs)
 	count, err := s.rdb.Incr(ctx, windowKey).Result()
 	if err != nil {
 		return true, maxReqs, err
@@ -844,22 +914,26 @@ func (s *Store) BlockingRead(ctx context.Context, teamID, channel, afterID strin
 
 	// Enrich reply counts
 	if len(messages) > 0 {
-		pipe := s.rdb.Pipeline()
-		cmds := make([]*redis.StringCmd, len(messages))
-		for i, m := range messages {
-			cmds[i] = pipe.HGet(ctx, s.k(teamID, "thrc:"+channel), m.ID)
-		}
-		pipe.Exec(ctx)
-		for i, cmd := range cmds {
-			if v, err := cmd.Result(); err == nil {
-				if n, err := strconv.Atoi(v); err == nil {
-					messages[i].ReplyCount = n
-				}
-			}
-		}
+		s.enrichReplyCounts(ctx, teamID, channel, messages)
 	}
 
 	return messages, nil
+}
+
+func (s *Store) enrichReplyCounts(ctx context.Context, teamID, channel string, messages []Message) {
+	pipe := s.rdb.Pipeline()
+	cmds := make([]*redis.StringCmd, len(messages))
+	for i, m := range messages {
+		cmds[i] = pipe.HGet(ctx, s.k(teamID, "thrc:"+channel), m.ID)
+	}
+	pipe.Exec(ctx)
+	for i, cmd := range cmds {
+		if v, err := cmd.Result(); err == nil {
+			if n, err := strconv.Atoi(v); err == nil {
+				messages[i].ReplyCount = n
+			}
+		}
+	}
 }
 
 // ---- Helpers ----

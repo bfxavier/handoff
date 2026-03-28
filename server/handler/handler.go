@@ -353,6 +353,14 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "MISSING_FIELDS", "team_name and sender_name are required")
 		return
 	}
+	if len(body.TeamName) > 128 {
+		apiError(w, 400, "FIELD_TOO_LARGE", "team_name must be 128 characters or less")
+		return
+	}
+	if len(body.SenderName) > 128 {
+		apiError(w, 400, "FIELD_TOO_LARGE", "sender_name must be 128 characters or less")
+		return
+	}
 	team, apiKey, err := s.store.CreateTeam(r.Context(), body.TeamName, body.SenderName)
 	if err != nil {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
@@ -371,6 +379,10 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.SenderName == "" {
 		apiError(w, 400, "MISSING_FIELDS", "sender_name is required")
+		return
+	}
+	if len(body.SenderName) > 128 {
+		apiError(w, 400, "FIELD_TOO_LARGE", "sender_name must be 128 characters or less")
 		return
 	}
 	ak := getApiKey(r)
@@ -679,6 +691,13 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		info, err := s.rdb.XInfoStream(ctx, fmt.Sprintf("t:%s:msg:%s", ak.TeamID, ch)).Result()
 		if err == nil {
 			cursor = info.LastGeneratedID
+		} else if err == redis.Nil || strings.Contains(err.Error(), "no such key") {
+			cursor = "0-0"
+		} else {
+			// Real Redis error — don't silently replay the entire stream
+			fmt.Fprintf(w, "event: error\ndata: {\"error\":\"failed to resolve stream cursor\"}\n\n")
+			flusher.Flush()
+			return
 		}
 		if cursor == "$" || cursor == "" {
 			cursor = "0-0"

@@ -795,3 +795,86 @@ func TestChannelLimitReached(t *testing.T) {
 		t.Errorf("3rd channel: status = %d, want 403", rec3.Code)
 	}
 }
+
+// ---- Signup field length validation ----
+
+func TestSignupTeamNameTooLong(t *testing.T) {
+	srv, _ := setup(t)
+	longName := strings.Repeat("a", 129)
+	body := `{"team_name":"` + longName + `","sender_name":"agent"}`
+	rec := doReq(srv, "POST", "/api/signup", body, "")
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	m := parseJSON(t, rec)
+	if m["code"] != "FIELD_TOO_LARGE" {
+		t.Errorf("code = %v, want FIELD_TOO_LARGE", m["code"])
+	}
+}
+
+func TestSignupSenderNameTooLong(t *testing.T) {
+	srv, _ := setup(t)
+	longName := strings.Repeat("b", 129)
+	body := `{"team_name":"team","sender_name":"` + longName + `"}`
+	rec := doReq(srv, "POST", "/api/signup", body, "")
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	m := parseJSON(t, rec)
+	if m["code"] != "FIELD_TOO_LARGE" {
+		t.Errorf("code = %v, want FIELD_TOO_LARGE", m["code"])
+	}
+}
+
+func TestSignupFieldLengthAtLimit(t *testing.T) {
+	srv, _ := setup(t)
+	name128 := strings.Repeat("c", 128)
+	body := `{"team_name":"` + name128 + `","sender_name":"agent"}`
+	rec := doReq(srv, "POST", "/api/signup", body, "")
+	if rec.Code != 201 {
+		t.Errorf("status = %d, want 201 (128 chars should be ok)", rec.Code)
+	}
+}
+
+func TestCreateKeySenderNameTooLong(t *testing.T) {
+	srv, key := setup(t)
+	longName := strings.Repeat("d", 129)
+	body := `{"sender_name":"` + longName + `"}`
+	rec := doReq(srv, "POST", "/api/keys", body, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	m := parseJSON(t, rec)
+	if m["code"] != "FIELD_TOO_LARGE" {
+		t.Errorf("code = %v, want FIELD_TOO_LARGE", m["code"])
+	}
+}
+
+// ---- DefaultConfig ensures quotas work ----
+
+func TestDefaultConfigAllowsSignupAndChannels(t *testing.T) {
+	// Verify DefaultConfig() has non-zero quotas (the old bug was Config{} with zero values)
+	rdb := testutil.RedisClient(t)
+	testutil.FlushDB(t, rdb)
+	s := store.New(rdb)
+	srv := New(s, rdb, DefaultConfig())
+
+	// Signup should work
+	rec := doReq(srv, "POST", "/api/signup", `{"team_name":"test","sender_name":"agent"}`, "")
+	if rec.Code != 201 {
+		t.Fatalf("signup status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+	key := parseJSON(t, rec)["api_key"].(string)
+
+	// Channel creation should work
+	rec2 := doReq(srv, "POST", "/api/channels", `{"name":"general"}`, key)
+	if rec2.Code != 201 {
+		t.Errorf("create channel status = %d, want 201; body: %s", rec2.Code, rec2.Body.String())
+	}
+
+	// Key creation should work
+	rec3 := doReq(srv, "POST", "/api/keys", `{"sender_name":"agent2"}`, key)
+	if rec3.Code != 201 {
+		t.Errorf("create key status = %d, want 201; body: %s", rec3.Code, rec3.Body.String())
+	}
+}

@@ -48,10 +48,9 @@ func main() {
 	log.Printf("Redis connected: %s", redisURL)
 
 	s := store.New(rdb)
-	cfg := handler.Config{
-		RateLimitMax:      rateLimitMax,
-		RateLimitWindowMs: rateLimitWindowMs,
-	}
+	cfg := handler.DefaultConfig()
+	cfg.RateLimitMax = rateLimitMax
+	cfg.RateLimitWindowMs = rateLimitWindowMs
 	srv := handler.New(s, rdb, cfg)
 
 	// Serve static files from public/ if it exists

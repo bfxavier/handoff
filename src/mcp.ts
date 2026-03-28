@@ -356,16 +356,15 @@ server.registerTool(
   },
   async (input) => {
     try {
-      const url = `${API_URL}/api/channels/${encodeURIComponent(input.channel)}/status/${encodeURIComponent(input.key)}`;
-      const res = await fetch(url, {
-        method: "DELETE",
-        headers: { "Authorization": `Bearer ${API_KEY}` },
-      });
-      if (res.status === 204) return ok({ deleted: true, key: input.key });
-      if (res.status === 404) return ok({ deleted: false, error: "Status key not found" });
-      const text = await res.text();
-      throw new Error(`API error ${res.status}: ${text}`);
+      const result = await api(
+        "DELETE",
+        `/api/channels/${encodeURIComponent(input.channel)}/status/${encodeURIComponent(input.key)}`
+      );
+      return ok({ deleted: true, key: input.key, ...((result && typeof result === 'object') ? result : {}) });
     } catch (e) {
+      if (e instanceof Error && e.message.includes("404")) {
+        return ok({ deleted: false, error: "Status key not found" });
+      }
       return err(e);
     }
   }

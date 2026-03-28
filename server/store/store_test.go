@@ -734,3 +734,164 @@ func TestReadThreadDefaultLimit(t *testing.T) {
 		t.Errorf("expected 1, got %d", len(thread.Replies))
 	}
 }
+
+// ---- compareStreamIDs ----
+
+func TestCompareStreamIDs(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int
+	}{
+		{"10-1", "9-9", 1},    // numeric > lexicographic
+		{"9-9", "10-1", -1},   // the old bug case
+		{"100-0", "100-0", 0}, // equal
+		{"100-1", "100-2", -1},
+		{"100-2", "100-1", 1},
+		{"1000000000000-0", "999999999999-0", 1},
+	}
+	for _, tt := range tests {
+		got := compareStreamIDs(tt.a, tt.b)
+		if got != tt.want {
+			t.Errorf("compareStreamIDs(%q, %q) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+// ---- Rate limit key hashing ----
+
+func TestCheckRateLimitKeyNotExposed(t *testing.T) {
+	s, ctx := setup(t)
+	secretKey := "relay_supersecretkey123456"
+	s.CheckRateLimit(ctx, secretKey, 100, 1000)
+
+	// SCAN for keys containing the raw secret — should find none
+	var cursor uint64
+	for {
+		keys, next, err := s.Redis().Scan(ctx, cursor, "*"+secretKey+"*", 100).Result()
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if len(keys) > 0 {
+			t.Errorf("found raw API key in Redis key names: %v", keys)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
+	// Verify rate limit key exists with hashed prefix
+	keys, _, _ := s.Redis().Scan(ctx, 0, "rl:*", 100).Result()
+	if len(keys) == 0 {
+		t.Error("no rate limit keys found")
+	}
+}
+
+// ---- Filtered pagination (scan-and-fill) ----
+
+func TestReadMessagesFilteredPagination(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+
+	// Post 20 messages: 10 from alice, 10 from bob, interleaved
+	for i := 0; i < 20; i++ {
+		sender := "alice"
+		if i%2 == 1 {
+			sender = "bob"
+		}
+		s.PostMessage(ctx, teamID, "ch1", sender, "msg", nil, nil)
+	}
+
+	// Read with sender filter, limit 5 — should get exactly 5 alice messages
+	alice := "alice"
+	r, err := s.ReadMessages(ctx, teamID, "ch1", nil, 5, nil, &alice, nil)
+	if err != nil {
+		t.Fatalf("ReadMessages: %v", err)
+	}
+	if len(r.Messages) != 5 {
+		t.Errorf("expected 5 alice messages, got %d", len(r.Messages))
+	}
+	for _, m := range r.Messages {
+		if m.Sender != "alice" {
+			t.Errorf("expected sender alice, got %s", m.Sender)
+		}
+	}
+
+	// Paginate: read next 5 using cursor
+	r2, err := s.ReadMessages(ctx, teamID, "ch1", &r.NextAfterID, 5, nil, &alice, nil)
+	if err != nil {
+		t.Fatalf("ReadMessages page 2: %v", err)
+	}
+	if len(r2.Messages) != 5 {
+		t.Errorf("expected 5 alice messages on page 2, got %d", len(r2.Messages))
+	}
+
+	// No overlap between pages
+	lastPage1 := r.Messages[len(r.Messages)-1].ID
+	firstPage2 := r2.Messages[0].ID
+	if compareStreamIDs(firstPage2, lastPage1) <= 0 {
+		t.Errorf("page 2 first message (%s) should be after page 1 last (%s)", firstPage2, lastPage1)
+	}
+}
+
+func TestReadMessagesFilteredMentionPagination(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+
+	// Post 15 messages: only 3 mention "bob"
+	bob := "bob"
+	for i := 0; i < 15; i++ {
+		var mention *string
+		if i == 3 || i == 7 || i == 12 {
+			mention = &bob
+		}
+		s.PostMessage(ctx, teamID, "ch1", "alice", "msg", mention, nil)
+	}
+
+	// Read with mention filter, limit 10 — should get all 3
+	r, err := s.ReadMessages(ctx, teamID, "ch1", nil, 10, &bob, nil, nil)
+	if err != nil {
+		t.Fatalf("ReadMessages: %v", err)
+	}
+	if len(r.Messages) != 3 {
+		t.Errorf("expected 3 messages mentioning bob, got %d", len(r.Messages))
+	}
+}
+
+// ---- Pipelined ListChannels ----
+
+func TestListChannelsPipelined(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+
+	desc := "test desc"
+	s.CreateChannel(ctx, teamID, "alpha", &desc)
+	s.CreateChannel(ctx, teamID, "beta", nil)
+	s.CreateChannel(ctx, teamID, "gamma", nil)
+
+	channels, err := s.ListChannels(ctx, teamID)
+	if err != nil {
+		t.Fatalf("ListChannels: %v", err)
+	}
+	if len(channels) != 3 {
+		t.Fatalf("expected 3 channels, got %d", len(channels))
+	}
+	// Should be sorted
+	if channels[0].Name != "alpha" || channels[1].Name != "beta" || channels[2].Name != "gamma" {
+		t.Errorf("unexpected order: %v, %v, %v", channels[0].Name, channels[1].Name, channels[2].Name)
+	}
+	if channels[0].Description == nil || *channels[0].Description != "test desc" {
+		t.Errorf("expected description 'test desc', got %v", channels[0].Description)
+	}
+}
+
+func TestListChannelsEmpty(t *testing.T) {
+	s, ctx := setup(t)
+	channels, err := s.ListChannels(ctx, "no-such-team")
+	if err != nil {
+		t.Fatalf("ListChannels: %v", err)
+	}
+	if len(channels) != 0 {
+		t.Errorf("expected 0 channels, got %d", len(channels))
+	}
+}
