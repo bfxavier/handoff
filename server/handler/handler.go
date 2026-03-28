@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bfxavier/handoff/server/store"
@@ -17,20 +19,31 @@ import (
 type Config struct {
 	RateLimitMax      int
 	RateLimitWindowMs int64
+	SignupPerIPMax    int   // max signups per IP per hour
+	MaxKeysPerTeam    int   // max API keys per team
+	MaxChannelsPerTeam int  // max channels per team
+	MaxMsgsPerChannel int64 // max messages retained per channel (XTRIM)
+	MaxSSEPerKey      int   // max concurrent SSE connections per key
 }
 
 func DefaultConfig() Config {
 	return Config{
 		RateLimitMax:      100,
 		RateLimitWindowMs: 1000,
+		SignupPerIPMax:    10,
+		MaxKeysPerTeam:    20,
+		MaxChannelsPerTeam: 50,
+		MaxMsgsPerChannel: 10000,
+		MaxSSEPerKey:      5,
 	}
 }
 
 type Server struct {
-	store  *store.Store
-	rdb    *redis.Client
-	config Config
-	mux    *http.ServeMux
+	store    *store.Store
+	rdb      *redis.Client
+	config   Config
+	mux      *http.ServeMux
+	sseConns sync.Map // key -> *int32 (atomic counter)
 }
 
 func New(s *store.Store, rdb *redis.Client, cfg Config) *Server {
@@ -274,7 +287,25 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 
 // ---- Auth endpoints ----
 
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		return strings.Split(fwd, ",")[0]
+	}
+	if real := r.Header.Get("X-Real-IP"); real != "" {
+		return real
+	}
+	return strings.Split(r.RemoteAddr, ":")[0]
+}
+
 func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
+	// IP-based rate limit for signups
+	ip := clientIP(r)
+	allowed, _, _ := s.store.CheckRateLimit(r.Context(), "signup:"+ip, s.config.SignupPerIPMax, 3600000) // per hour
+	if !allowed {
+		apiError(w, 429, "SIGNUP_RATE_LIMITED", "Too many signups from this IP. Try again later.")
+		return
+	}
+
 	var body struct {
 		TeamName   string `json:"team_name"`
 		SenderName string `json:"sender_name"`
@@ -308,6 +339,14 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ak := getApiKey(r)
+
+	// Check team key quota
+	existing, _ := s.store.ListApiKeys(r.Context(), ak.TeamID)
+	if len(existing) >= s.config.MaxKeysPerTeam {
+		apiError(w, 403, "KEY_LIMIT_REACHED", fmt.Sprintf("Maximum %d keys per team", s.config.MaxKeysPerTeam))
+		return
+	}
+
 	key, err := s.store.CreateApiKey(r.Context(), ak.TeamID, body.SenderName)
 	if err != nil {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
@@ -346,6 +385,14 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ak := getApiKey(r)
+
+	// Check channel quota
+	channels, _ := s.store.ListChannels(r.Context(), ak.TeamID)
+	if len(channels) >= s.config.MaxChannelsPerTeam {
+		apiError(w, 403, "CHANNEL_LIMIT_REACHED", fmt.Sprintf("Maximum %d channels per team", s.config.MaxChannelsPerTeam))
+		return
+	}
+
 	ch, created, err := s.store.CreateChannel(r.Context(), ak.TeamID, body.Name, body.Description)
 	if err != nil {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
@@ -424,6 +471,10 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
 		return
 	}
+
+	// Trim old messages to prevent unbounded growth
+	s.store.TrimMessages(r.Context(), ak.TeamID, ch, s.config.MaxMsgsPerChannel)
+
 	writeJSON(w, 201, msg)
 }
 
@@ -521,6 +572,11 @@ func (s *Server) handleReadThread(w http.ResponseWriter, r *http.Request) {
 
 // ---- SSE ----
 
+func (s *Server) sseCount(key string) *int32 {
+	v, _ := s.sseConns.LoadOrStore(key, new(int32))
+	return v.(*int32)
+}
+
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -529,6 +585,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ak := getApiKey(r)
+
+	// Check SSE connection limit per key
+	counter := s.sseCount(ak.Key)
+	current := atomic.AddInt32(counter, 1)
+	if int(current) > s.config.MaxSSEPerKey {
+		atomic.AddInt32(counter, -1)
+		apiError(w, 429, "SSE_LIMIT_REACHED", fmt.Sprintf("Maximum %d concurrent SSE connections per key", s.config.MaxSSEPerKey))
+		return
+	}
+	defer atomic.AddInt32(counter, -1)
+
 	ch := r.PathValue("channel")
 	lastEventID := r.Header.Get("Last-Event-ID")
 	if lastEventID == "" {

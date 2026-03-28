@@ -370,6 +370,14 @@ func (s *Store) PostMessage(ctx context.Context, teamID, channel, sender, conten
 	return msg, nil
 }
 
+// TrimMessages caps the number of messages in a channel stream.
+func (s *Store) TrimMessages(ctx context.Context, teamID, channel string, maxLen int64) {
+	if maxLen <= 0 {
+		return
+	}
+	s.rdb.XTrimMaxLen(ctx, s.k(teamID, "msg:"+channel), maxLen)
+}
+
 func (s *Store) DeleteMessage(ctx context.Context, teamID, channel, msgID string) (bool, error) {
 	n, err := s.rdb.XDel(ctx, s.k(teamID, "msg:"+channel), msgID).Result()
 	if err != nil {
