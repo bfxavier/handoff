@@ -150,8 +150,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/channels/{channel}/stream", s.auth(s.handleSSE))
 	s.mux.HandleFunc("POST /api/channels/{channel}/ack", s.auth(s.rateLimit(s.handleAck)))
 	s.mux.HandleFunc("GET /api/channels/{channel}/acks", s.auth(s.rateLimit(s.handleGetAcks)))
+	s.mux.HandleFunc("GET /api/channels/{channel}/unread", s.auth(s.rateLimit(s.handleUnread)))
 	s.mux.HandleFunc("PUT /api/channels/{channel}/status", s.auth(s.rateLimit(s.handleSetStatus)))
 	s.mux.HandleFunc("POST /api/channels/{channel}/status", s.auth(s.rateLimit(s.handleSetStatus)))
+	s.mux.HandleFunc("DELETE /api/channels/{channel}/status/{key}", s.auth(s.rateLimit(s.handleDeleteStatus)))
 	s.mux.HandleFunc("GET /api/channels/{channel}/status", s.auth(s.rateLimit(s.handleGetStatus)))
 	s.mux.HandleFunc("GET /api/channels/{channel}/status/changes", s.auth(s.rateLimit(s.handleGetStatusChanges)))
 	s.mux.HandleFunc("GET /api/status", s.auth(s.rateLimit(s.handleGetStatusCrossChannel)))
@@ -248,11 +250,13 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 			{"method": "DELETE", "path": "/api/channels/{channel}/messages/{id}", "description": "Delete a message"},
 			{"method": "GET", "path": "/api/channels/{channel}/threads/{id}", "description": "Read a thread (parent + replies, query: after_id, limit)"},
 			{"method": "GET", "path": "/api/channels/{channel}/stream", "description": "SSE stream of new messages (query: token, last_event_id)"},
-			{"method": "POST", "path": "/api/channels/{channel}/ack", "description": "Acknowledge messages"},
+			{"method": "POST", "path": "/api/channels/{channel}/ack", "description": "Acknowledge messages up to a given ID"},
 			{"method": "GET", "path": "/api/channels/{channel}/acks", "description": "Get ack state for all agents"},
+			{"method": "GET", "path": "/api/channels/{channel}/unread", "description": "Get unread messages (after your last ack)"},
 			{"method": "GET", "path": "/api/channels/{channel}/status", "description": "Get status entries (query: key)"},
 			{"method": "PUT", "path": "/api/channels/{channel}/status", "description": "Set a status entry"},
 			{"method": "POST", "path": "/api/channels/{channel}/status", "description": "Set a status entry (alias for PUT)"},
+			{"method": "DELETE", "path": "/api/channels/{channel}/status/{key}", "description": "Delete a status entry"},
 			{"method": "GET", "path": "/api/channels/{channel}/status/changes", "description": "Read status change log (query: after_id, limit)"},
 			{"method": "GET", "path": "/api/status", "description": "Cross-channel status query (query: channel, key)"},
 			{"method": "GET", "path": "/healthz", "description": "Liveness probe", "auth": false},
@@ -638,6 +642,27 @@ func (s *Server) handleGetAcks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, acks)
 }
 
+// GET /api/channels/{channel}/unread — messages after sender's last ack
+func (s *Server) handleUnread(w http.ResponseWriter, r *http.Request) {
+	ak := getApiKey(r)
+	ch := r.PathValue("channel")
+	limit := 50
+	if ls := r.URL.Query().Get("limit"); ls != "" {
+		l, err := strconv.Atoi(ls)
+		if err != nil || l < 1 || l > 100 {
+			apiError(w, 400, "INVALID_LIMIT", "limit must be an integer between 1 and 100")
+			return
+		}
+		limit = l
+	}
+	result, err := s.store.GetUnread(r.Context(), ak.TeamID, ch, ak.Sender, limit)
+	if err != nil {
+		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
 // ---- Status ----
 
 func (s *Server) handleSetStatus(w http.ResponseWriter, r *http.Request) {
@@ -682,6 +707,22 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, statuses)
+}
+
+func (s *Server) handleDeleteStatus(w http.ResponseWriter, r *http.Request) {
+	ak := getApiKey(r)
+	ch := r.PathValue("channel")
+	key := r.PathValue("key")
+	deleted, err := s.store.DeleteStatus(r.Context(), ak.TeamID, ch, key)
+	if err != nil {
+		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+	if !deleted {
+		apiError(w, 404, "STATUS_NOT_FOUND", "Status key not found")
+		return
+	}
+	w.WriteHeader(204)
 }
 
 func (s *Server) handleGetStatusCrossChannel(w http.ResponseWriter, r *http.Request) {

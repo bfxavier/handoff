@@ -552,6 +552,32 @@ func (s *Store) GetAcks(ctx context.Context, teamID, channel string) ([]Ack, err
 	return acks, nil
 }
 
+// GetUnread returns messages after the sender's last ack watermark.
+func (s *Store) GetUnread(ctx context.Context, teamID, channel, sender string, limit int) (*ReadResult, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	// Get sender's last ack
+	ackKey := s.k(teamID, "acks:"+channel)
+	afterID := "0-0"
+	raw, err := s.rdb.HGet(ctx, ackKey, sender).Result()
+	if err == nil && raw != "" {
+		var ack Ack
+		if json.Unmarshal([]byte(raw), &ack) == nil {
+			afterID = ack.LastReadID
+		}
+	}
+	return s.ReadMessages(ctx, teamID, channel, &afterID, limit, nil, nil, nil)
+}
+
+func (s *Store) DeleteStatus(ctx context.Context, teamID, channel, key string) (bool, error) {
+	n, err := s.rdb.HDel(ctx, s.k(teamID, "status:"+channel), key).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ---- Status ----
 
 func (s *Store) SetStatus(ctx context.Context, teamID, channel, key, value string, updatedBy *string) (*Status, error) {

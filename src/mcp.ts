@@ -90,8 +90,9 @@ server.registerTool(
   {
     description:
       "Post a message to a channel. The channel is auto-created if it doesn't exist. " +
-      "Use 'mention' to flag a specific recipient (e.g. another agent's sender name) — recipients can filter by mention when reading. " +
+      "IMPORTANT: Always set 'mention' when directing a message at a specific agent — this is how they filter for messages meant for them. " +
       "Use 'thread_id' to reply to a specific message, creating a threaded conversation. " +
+      "After reading messages, call 'ack' with the last message ID so other agents know you've seen them. " +
       "Your sender identity is derived from your API key on the server side.",
     inputSchema: {
       channel: z.string().describe("Channel name to post to"),
@@ -121,9 +122,11 @@ server.registerTool(
       "Read messages from a channel. Returns a cursor (next_after_id) and has_more flag for efficient polling — " +
       "pass the returned next_after_id as after_id on the next call to receive only new messages. " +
       "Omit after_id to get the most recent messages. " +
-      "Use 'mention' to filter for messages directed at a specific agent. " +
+      "Use 'mention' to filter for messages directed at you. " +
       "Use 'sender' to filter by who sent the message. " +
       "Messages include thread_id (if a reply) and reply_count (number of threaded replies). " +
+      "IMPORTANT: After reading, call 'ack' with the last message ID to signal you've read them. " +
+      "Tip: Use 'read_unread' instead to get only messages you haven't acked yet. " +
       "Default limit is 50; maximum is 100.",
     inputSchema: {
       channel: z.string().describe("Channel name to read from"),
@@ -226,6 +229,31 @@ server.registerTool(
 );
 
 server.registerTool(
+  "read_unread",
+  {
+    description:
+      "Read only messages you haven't acknowledged yet. Uses your ack watermark as the cursor — " +
+      "returns messages posted after your last 'ack' call. This is the recommended way to check for new messages. " +
+      "After reading, call 'ack' with the last message ID.",
+    inputSchema: {
+      channel: z.string().describe("Channel name to check for unread messages"),
+      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of messages to return (default 50)"),
+    },
+  },
+  async (input) => {
+    try {
+      const params = new URLSearchParams();
+      if (input.limit !== undefined) params.set("limit", String(input.limit));
+      const qs = params.size > 0 ? `?${params}` : "";
+      const result = await api("GET", `/api/channels/${encodeURIComponent(input.channel)}/unread${qs}`);
+      return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
   "set_status",
   {
     description:
@@ -310,6 +338,33 @@ server.registerTool(
         `/api/channels/${encodeURIComponent(input.channel)}/status/changes${qs}`
       );
       return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
+  "delete_status",
+  {
+    description:
+      "Delete a status key from a channel. Use this to clean up status entries that are no longer relevant.",
+    inputSchema: {
+      channel: z.string().describe("Channel name"),
+      key: z.string().describe("Status key to delete"),
+    },
+  },
+  async (input) => {
+    try {
+      const url = `${API_URL}/api/channels/${encodeURIComponent(input.channel)}/status/${encodeURIComponent(input.key)}`;
+      const res = await fetch(url, {
+        method: "DELETE",
+        headers: { "Authorization": `Bearer ${API_KEY}` },
+      });
+      if (res.status === 204) return ok({ deleted: true, key: input.key });
+      if (res.status === 404) return ok({ deleted: false, error: "Status key not found" });
+      const text = await res.text();
+      throw new Error(`API error ${res.status}: ${text}`);
     } catch (e) {
       return err(e);
     }
