@@ -41,43 +41,59 @@ func New(s *store.Store, rdb *redis.Client, cfg Config) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Wrap response to catch ServeMux's default 404 and return JSON instead
-	wrapped := &jsonNotFoundWriter{ResponseWriter: w, req: r}
+	// Track whether a registered handler was invoked
+	wrapped := &routeTracker{ResponseWriter: w}
 	s.mux.ServeHTTP(wrapped, r)
-	if !wrapped.written || wrapped.intercepted {
+	if !wrapped.handlerCalled {
+		// ServeMux found no matching route — return JSON 404
 		apiError(w, 404, "NOT_FOUND", "Route not found")
 	}
 }
 
-type jsonNotFoundWriter struct {
+// routeTracker detects whether ServeMux dispatched to one of our handlers
+// vs returning its default 404. It does this by checking if WriteHeader was
+// called with anything other than 404, or if Write was called with non-default content.
+// Since our handlers always call writeJSON which sets Content-Type to application/json,
+// we check for that.
+type routeTracker struct {
 	http.ResponseWriter
-	req        *http.Request
-	written    bool
-	intercepted bool
+	handlerCalled bool
+	headerWritten bool
 }
 
-func (w *jsonNotFoundWriter) WriteHeader(code int) {
-	if code == 404 && !w.written {
-		// Intercept ServeMux's default 404 — we'll write JSON instead
-		w.intercepted = true
-		return
+func (w *routeTracker) Header() http.Header {
+	return w.ResponseWriter.Header()
+}
+
+func (w *routeTracker) WriteHeader(code int) {
+	w.headerWritten = true
+	// If Content-Type is application/json, one of our handlers set it
+	if w.ResponseWriter.Header().Get("Content-Type") == "application/json" {
+		w.handlerCalled = true
 	}
-	w.written = true
+	// If it's not a 404, definitely a handler
+	if code != 404 {
+		w.handlerCalled = true
+	}
 	w.ResponseWriter.WriteHeader(code)
 }
 
-func (w *jsonNotFoundWriter) Write(b []byte) (int, error) {
-	if w.intercepted {
-		// Swallow ServeMux's "404 page not found" body
-		return len(b), nil
+func (w *routeTracker) Write(b []byte) (int, error) {
+	if !w.headerWritten {
+		// Implicit 200 — a handler is writing
+		w.handlerCalled = true
 	}
-	if !w.written {
-		w.written = true
+	if w.ResponseWriter.Header().Get("Content-Type") == "application/json" {
+		w.handlerCalled = true
+	}
+	if !w.handlerCalled {
+		// This is ServeMux's "404 page not found\n" — swallow it
+		return len(b), nil
 	}
 	return w.ResponseWriter.Write(b)
 }
 
-func (w *jsonNotFoundWriter) Flush() {
+func (w *routeTracker) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
