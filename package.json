@@ -1,7 +1,7 @@
 {
   "name": "handoff-sdk",
-  "version": "0.5.0",
-  "description": "Agent-to-agent coordination relay — SDK, MCP server + hosted API",
+  "version": "1.0.0",
+  "description": "Agent-to-agent coordination relay — SDK + MCP server for Claude Code",
   "type": "module",
   "main": "dist/sdk.js",
   "types": "dist/sdk.d.ts",
@@ -15,24 +15,37 @@
       "types": "./dist/types.d.ts"
     }
   },
+  "files": [
+    "dist/"
+  ],
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
+    "prepublishOnly": "npm run build",
     "mcp": "node dist/mcp.js"
   },
   "bin": {
-    "agent-relay-mcp": "dist/mcp.js"
+    "handoff-mcp": "dist/mcp.js"
   },
+  "keywords": [
+    "mcp",
+    "agent",
+    "relay",
+    "coordination",
+    "claude",
+    "handoff",
+    "sse",
+    "e2ee"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bfxavier/handoff"
+  },
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "ioredis": "^5.6.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.17",
-    "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
   }
