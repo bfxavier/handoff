@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import { webcrypto } from "crypto";
 import type {
   Channel, Message, ReadResult, Status, StatusChange, Ack, ThreadResult,
 } from "./types.js";
@@ -10,6 +11,10 @@ export type {
 export interface HandoffOptions {
   apiUrl: string;
   apiKey: string;
+  /** Team-shared encryption key for E2EE. When set, message content and status
+   *  values are encrypted client-side with AES-256-GCM before being sent to
+   *  the server. The server only ever sees ciphertext. */
+  encryptionKey?: string;
 }
 
 export interface PostOptions {
@@ -37,6 +42,57 @@ export interface SubscribeOptions {
 export type MessageHandler = (message: Message) => void;
 export type ErrorHandler = (error: Error) => void;
 
+// ---- E2EE helpers ----
+
+const E2EE_PREFIX = "e2ee:";
+const subtle = (globalThis.crypto?.subtle ?? webcrypto.subtle) as SubtleCrypto;
+
+async function deriveKey(secret: string): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  const keyMaterial = await subtle.importKey(
+    "raw", enc.encode(secret), "PBKDF2", false, ["deriveKey"]
+  );
+  return subtle.deriveKey(
+    { name: "PBKDF2", salt: enc.encode("handoff-e2ee-v1"), iterations: 100000, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encrypt(key: CryptoKey, plaintext: string): Promise<string> {
+  const enc = new TextEncoder();
+  const iv = new Uint8Array(12);
+  const rng = globalThis.crypto ?? webcrypto;
+  (rng as Crypto).getRandomValues(iv);
+  const ciphertext = await subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    enc.encode(plaintext)
+  );
+  // Pack as: base64(iv + ciphertext)
+  const packed = new Uint8Array(iv.length + ciphertext.byteLength);
+  packed.set(iv);
+  packed.set(new Uint8Array(ciphertext), iv.length);
+  return E2EE_PREFIX + Buffer.from(packed).toString("base64");
+}
+
+async function decrypt(key: CryptoKey, encoded: string): Promise<string> {
+  if (!encoded.startsWith(E2EE_PREFIX)) return encoded; // plaintext passthrough
+  const packed = new Uint8Array(Buffer.from(encoded.slice(E2EE_PREFIX.length), "base64"));
+  const iv = packed.slice(0, 12);
+  const ciphertext = packed.slice(12);
+  const plaintext = await subtle.decrypt(
+    { name: "AES-GCM", iv },
+    key,
+    ciphertext
+  );
+  return new TextDecoder().decode(plaintext);
+}
+
+// ---- Error class ----
+
 export class HandoffError extends Error {
   constructor(
     message: string,
@@ -48,19 +104,23 @@ export class HandoffError extends Error {
   }
 }
 
+// ---- Subscription (SSE) ----
+
 export class Subscription extends EventEmitter {
   private controller: AbortController;
   private running = false;
+  private decryptFn: ((s: string) => Promise<string>) | null;
 
   constructor(
     private url: string,
-    private channel: string
+    private channel: string,
+    decryptFn: ((s: string) => Promise<string>) | null
   ) {
     super();
     this.controller = new AbortController();
+    this.decryptFn = decryptFn;
   }
 
-  /** Start the SSE connection. Call .close() to stop. */
   async connect(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -104,10 +164,12 @@ export class Subscription extends EventEmitter {
           } else if (line.startsWith("id: ")) {
             currentId = line.slice(4);
           } else if (line === "") {
-            // End of event
             if (currentEvent === "message" && currentData) {
               try {
                 const msg: Message = JSON.parse(currentData);
+                if (this.decryptFn) {
+                  msg.content = await this.decryptFn(msg.content);
+                }
                 this.emit("message", msg);
               } catch {
                 // Skip malformed events
@@ -116,9 +178,7 @@ export class Subscription extends EventEmitter {
               try {
                 const err = JSON.parse(currentData);
                 this.emit("error", new HandoffError(err.error || "Stream error", 0, "SSE_ERROR"));
-              } catch {
-                // Skip
-              }
+              } catch { /* skip */ }
             }
             currentEvent = "";
             currentData = "";
@@ -139,18 +199,15 @@ export class Subscription extends EventEmitter {
     }
   }
 
-  /** True if the SSE connection is active */
   get connected(): boolean {
     return this.running;
   }
 
-  /** Disconnect the SSE stream */
   close(): void {
     this.running = false;
     this.controller.abort();
   }
 
-  // Typed event overloads
   on(event: "message", listener: MessageHandler): this;
   on(event: "error", listener: ErrorHandler): this;
   on(event: "cursor", listener: (id: string) => void): this;
@@ -161,13 +218,68 @@ export class Subscription extends EventEmitter {
   }
 }
 
+// ---- Main client ----
+
 export class Handoff {
   private apiUrl: string;
   private apiKey: string;
+  private cryptoKey: CryptoKey | null = null;
+  private cryptoKeyPromise: Promise<CryptoKey> | null = null;
+
+  /** True if E2EE is enabled */
+  readonly encrypted: boolean;
 
   constructor(options: HandoffOptions) {
     this.apiUrl = options.apiUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
+    this.encrypted = !!options.encryptionKey;
+    if (options.encryptionKey) {
+      this.cryptoKeyPromise = deriveKey(options.encryptionKey).then(k => {
+        this.cryptoKey = k;
+        return k;
+      });
+    }
+  }
+
+  private async getKey(): Promise<CryptoKey> {
+    if (this.cryptoKey) return this.cryptoKey;
+    if (this.cryptoKeyPromise) return this.cryptoKeyPromise;
+    throw new Error("E2EE not enabled");
+  }
+
+  private async encryptContent(plaintext: string): Promise<string> {
+    if (!this.encrypted) return plaintext;
+    return encrypt(await this.getKey(), plaintext);
+  }
+
+  private async decryptContent(ciphertext: string): Promise<string> {
+    if (!this.encrypted) return ciphertext;
+    return decrypt(await this.getKey(), ciphertext);
+  }
+
+  private async decryptMessage(msg: Message): Promise<Message> {
+    if (!this.encrypted) return msg;
+    return { ...msg, content: await this.decryptContent(msg.content) };
+  }
+
+  private async decryptMessages(msgs: Message[]): Promise<Message[]> {
+    if (!this.encrypted) return msgs;
+    return Promise.all(msgs.map(m => this.decryptMessage(m)));
+  }
+
+  private async decryptStatus(st: Status): Promise<Status> {
+    if (!this.encrypted) return st;
+    return { ...st, value: await this.decryptContent(st.value) };
+  }
+
+  private async decryptStatuses(statuses: Status[]): Promise<Status[]> {
+    if (!this.encrypted) return statuses;
+    return Promise.all(statuses.map(s => this.decryptStatus(s)));
+  }
+
+  private async decryptStatusChange(sc: StatusChange): Promise<StatusChange> {
+    if (!this.encrypted) return sc;
+    return { ...sc, value: await this.decryptContent(sc.value) };
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -212,11 +324,14 @@ export class Handoff {
   // ---- Messages ----
 
   async post(channel: string, content: string, options?: PostOptions): Promise<Message> {
-    return this.request("POST", `/api/channels/${encodeURIComponent(channel)}/messages`, {
-      content,
+    const encrypted = await this.encryptContent(content);
+    const msg = await this.request<Message>("POST", `/api/channels/${encodeURIComponent(channel)}/messages`, {
+      content: encrypted,
       mention: options?.mention,
       thread_id: options?.thread_id,
     });
+    // Return with original plaintext content, not the ciphertext
+    return { ...msg, content };
   }
 
   async read(channel: string, options?: ReadOptions): Promise<ReadResult> {
@@ -227,7 +342,9 @@ export class Handoff {
     if (options?.sender) params.set("sender", options.sender);
     if (options?.thread_id) params.set("thread_id", options.thread_id);
     const qs = params.size > 0 ? `?${params}` : "";
-    return this.request("GET", `/api/channels/${encodeURIComponent(channel)}/messages${qs}`);
+    const result = await this.request<ReadResult>("GET", `/api/channels/${encodeURIComponent(channel)}/messages${qs}`);
+    result.messages = await this.decryptMessages(result.messages);
+    return result;
   }
 
   async deleteMessage(channel: string, messageId: string): Promise<void> {
@@ -245,7 +362,10 @@ export class Handoff {
     if (options?.after_id) params.set("after_id", options.after_id);
     if (options?.limit !== undefined) params.set("limit", String(options.limit));
     const qs = params.size > 0 ? `?${params}` : "";
-    return this.request("GET", `/api/channels/${encodeURIComponent(channel)}/threads/${encodeURIComponent(parentId)}${qs}`);
+    const result = await this.request<ThreadResult>("GET", `/api/channels/${encodeURIComponent(channel)}/threads/${encodeURIComponent(parentId)}${qs}`);
+    result.parent = await this.decryptMessage(result.parent);
+    result.replies = await this.decryptMessages(result.replies);
+    return result;
   }
 
   // ---- Subscriptions (SSE) ----
@@ -255,13 +375,12 @@ export class Handoff {
     params.set("token", this.apiKey);
     if (options?.last_event_id) params.set("last_event_id", options.last_event_id);
     const url = `${this.apiUrl}/api/channels/${encodeURIComponent(channel)}/stream?${params}`;
-    return new Subscription(url, channel);
+    const decryptFn = this.encrypted
+      ? (s: string) => this.decryptContent(s)
+      : null;
+    return new Subscription(url, channel, decryptFn);
   }
 
-  /**
-   * Convenience: subscribe and call handler for each message.
-   * Returns a function to unsubscribe.
-   */
   on(channel: string, handler: MessageHandler, options?: SubscribeOptions): () => void {
     const sub = this.subscribe(channel, options);
     sub.on("message", handler);
@@ -284,20 +403,25 @@ export class Handoff {
   // ---- Status ----
 
   async setStatus(channel: string, key: string, value: string): Promise<Status> {
-    return this.request("PUT", `/api/channels/${encodeURIComponent(channel)}/status`, { key, value });
+    const encrypted = await this.encryptContent(value);
+    const st = await this.request<Status>("PUT", `/api/channels/${encodeURIComponent(channel)}/status`, { key, value: encrypted });
+    return { ...st, value };
   }
 
   async getStatus(options?: { channel?: string; key?: string }): Promise<Status[]> {
+    let statuses: Status[];
     if (options?.channel) {
       const params = new URLSearchParams();
       if (options.key) params.set("key", options.key);
       const qs = params.size > 0 ? `?${params}` : "";
-      return this.request("GET", `/api/channels/${encodeURIComponent(options.channel)}/status${qs}`);
+      statuses = await this.request("GET", `/api/channels/${encodeURIComponent(options.channel)}/status${qs}`);
+    } else {
+      const params = new URLSearchParams();
+      if (options?.key) params.set("key", options.key);
+      const qs = params.size > 0 ? `?${params}` : "";
+      statuses = await this.request("GET", `/api/status${qs}`);
     }
-    const params = new URLSearchParams();
-    if (options?.key) params.set("key", options.key);
-    const qs = params.size > 0 ? `?${params}` : "";
-    return this.request("GET", `/api/status${qs}`);
+    return this.decryptStatuses(statuses);
   }
 
   async getStatusChanges(channel: string, options?: StatusChangesOptions): Promise<{ changes: StatusChange[]; next_after_id: string; has_more: boolean }> {
@@ -305,7 +429,11 @@ export class Handoff {
     if (options?.after_id) params.set("after_id", options.after_id);
     if (options?.limit !== undefined) params.set("limit", String(options.limit));
     const qs = params.size > 0 ? `?${params}` : "";
-    return this.request("GET", `/api/channels/${encodeURIComponent(channel)}/status/changes${qs}`);
+    const result = await this.request<{ changes: StatusChange[]; next_after_id: string; has_more: boolean }>(
+      "GET", `/api/channels/${encodeURIComponent(channel)}/status/changes${qs}`
+    );
+    result.changes = await Promise.all(result.changes.map(c => this.decryptStatusChange(c)));
+    return result;
   }
 }
 
