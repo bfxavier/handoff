@@ -263,10 +263,6 @@ func (s *Store) ListApiKeys(ctx context.Context, teamID string) ([]ApiKey, error
 		}
 		var ak ApiKey
 		if json.Unmarshal([]byte(raw), &ak) == nil {
-			// Key field is already the hash — show truncated hash for display
-			if len(ak.Key) > 12 {
-				ak.Key = ak.Key[:8] + "..."
-			}
 			keys = append(keys, ak)
 		}
 	}
