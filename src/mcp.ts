@@ -422,17 +422,18 @@ server.registerTool(
       "Requires admin permissions on your key.",
     inputSchema: {
       key_hash: z.string().describe("The key hash (from list_keys or create_key response)"),
-      permissions: z.record(z.string(), z.enum(["read", "write", "admin"])).describe(
-        "Map of channel name to permission level. Use '*' for wildcard."
+      permissions: z.string().describe(
+        'JSON object mapping channel name to permission level (e.g. \'{"build":"write","deploy":"read"}\'). Use \'*\' as key for wildcard.'
       ),
     },
   },
   async (input) => {
     try {
+      const perms = JSON.parse(input.permissions) as Record<string, string>;
       const result = await api(
         "PUT",
         `/api/keys/${encodeURIComponent(input.key_hash)}/permissions`,
-        { permissions: input.permissions }
+        { permissions: perms }
       );
       return ok(result);
     } catch (e) {
@@ -450,15 +451,15 @@ server.registerTool(
       "Optionally set initial permissions at creation time. Requires admin permissions.",
     inputSchema: {
       sender_name: z.string().describe("Display name for this key's sender identity (e.g. 'deploy-bot', 'reviewer')"),
-      permissions: z.record(z.string(), z.enum(["read", "write", "admin"])).optional().describe(
-        "Optional initial permissions. Map of channel name to permission level. Use '*' for wildcard."
+      permissions: z.string().optional().describe(
+        'Optional JSON object mapping channel name to permission level (e.g. \'{"*":"admin"}\'). Use \'*\' as key for wildcard.'
       ),
     },
   },
   async (input) => {
     try {
       const body: Record<string, unknown> = { sender_name: input.sender_name };
-      if (input.permissions) body.permissions = input.permissions;
+      if (input.permissions) body.permissions = JSON.parse(input.permissions) as Record<string, string>;
       const result = await api("POST", "/api/keys", body);
       return ok(result);
     } catch (e) {
