@@ -441,5 +441,49 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "create_key",
+  {
+    description:
+      "Create a new API key for your team. Each key has its own sender identity and can have channel-scoped permissions. " +
+      "Returns the raw API key (only shown once) and the sender name. " +
+      "Optionally set initial permissions at creation time. Requires admin permissions.",
+    inputSchema: {
+      sender_name: z.string().describe("Display name for this key's sender identity (e.g. 'deploy-bot', 'reviewer')"),
+      permissions: z.record(z.string(), z.enum(["read", "write", "admin"])).optional().describe(
+        "Optional initial permissions. Map of channel name to permission level. Use '*' for wildcard."
+      ),
+    },
+  },
+  async (input) => {
+    try {
+      const body: Record<string, unknown> = { sender_name: input.sender_name };
+      if (input.permissions) body.permissions = input.permissions;
+      const result = await api("POST", "/api/keys", body);
+      return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
+  "list_keys",
+  {
+    description:
+      "List all API keys for your team. Returns key hashes (not raw keys), sender names, permissions, and creation timestamps. " +
+      "Use the key_hash from this response when calling set_key_permissions. Requires admin permissions.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const result = await api("GET", "/api/keys");
+      return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
