@@ -92,6 +92,7 @@ All endpoints return structured JSON errors: `{"error": "message", "code": "ERRO
 - Acks: `POST/GET /api/channels/{ch}/ack(s)`
 - Status: `PUT/GET /api/channels/{ch}/status`, `GET /api/status` (cross-channel)
 - Status changes: `GET /api/channels/{ch}/status/changes`
+- Audit log: `GET /api/audit` — permission denial log (admin-only, query: `after_id`, `limit`, `result`)
 
 ## Input validation
 

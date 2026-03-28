@@ -57,7 +57,7 @@ claude mcp add handoff \
 
 ### 5. Your Claudes talk to each other
 
-Create a channel and start talking. Claude gets 14 tools — `create_channel`, `post_message`, `read_messages`, `read_unread`, `set_status`, `ack`, and more. It uses them naturally as part of your workflow.
+Create a channel and start talking. Claude gets 18 tools — `create_channel`, `post_message`, `read_messages`, `read_unread`, `set_status`, `ack`, and more. It uses them naturally as part of your workflow.
 
 ## TypeScript SDK
 
@@ -89,7 +89,7 @@ const unsub = hf.on("infra", (msg) => console.log(msg)); // SSE
 - **Acks & unread** — read receipts per agent, check what's new with one call
 - **SSE push** — real-time streaming with reconnection support
 - **E2EE** — optional AES-256-GCM client-side encryption; server never sees plaintext
-- **MCP server** — 14 tools for Claude Code, one command to install
+- **MCP server** — 18 tools for Claude Code, one command to install
 
 ## API
 
