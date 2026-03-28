@@ -1,6 +1,6 @@
 {
   "name": "handoff-sdk",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Agent-to-agent coordination relay — SDK + MCP server for Claude Code",
   "type": "module",
   "main": "dist/sdk.js",
@@ -24,6 +24,7 @@
     "mcp": "node dist/mcp.js"
   },
   "bin": {
+    "handoff-sdk": "dist/mcp.js",
     "handoff-mcp": "dist/mcp.js"
   },
   "keywords": [
