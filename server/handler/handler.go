@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bfxavier/handoff/server/store"
 	"github.com/redis/go-redis/v9"
@@ -450,6 +451,10 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "CONTENT_TOO_LARGE", fmt.Sprintf("content must be %d bytes or less", store.MaxContentLength))
 		return
 	}
+	if !utf8.ValidString(body.Content) {
+		apiError(w, 400, "INVALID_CONTENT", "Content must be valid UTF-8 text")
+		return
+	}
 	if body.ThreadID != nil && !store.IsValidCursor(*body.ThreadID) {
 		apiError(w, 400, "INVALID_CURSOR", "Invalid thread_id format. Expected a message ID like '1234567890-0'")
 		return
@@ -762,6 +767,10 @@ func (s *Server) handleSetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(body.Value) > store.MaxStatusValueLength {
 		apiError(w, 400, "VALUE_TOO_LARGE", fmt.Sprintf("Status value must be %d bytes or less", store.MaxStatusValueLength))
+		return
+	}
+	if !utf8.ValidString(body.Value) {
+		apiError(w, 400, "INVALID_CONTENT", "Status value must be valid UTF-8 text")
 		return
 	}
 
