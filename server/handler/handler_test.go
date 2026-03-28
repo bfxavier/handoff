@@ -446,3 +446,352 @@ func TestInvalidJSON(t *testing.T) {
 		t.Errorf("code = %v", m["code"])
 	}
 }
+
+// ---- Additional coverage tests ----
+
+func TestCreateAndListKeys(t *testing.T) {
+	srv, key := setup(t)
+	// Create a second key
+	rec := doReq(srv, "POST", "/api/keys", `{"sender_name":"agent-2"}`, key)
+	if rec.Code != 201 {
+		t.Fatalf("create key: status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	// List keys
+	rec2 := doReq(srv, "GET", "/api/keys", "", key)
+	if rec2.Code != 200 {
+		t.Fatalf("list keys: status = %d", rec2.Code)
+	}
+	var keys []map[string]interface{}
+	json.Unmarshal(rec2.Body.Bytes(), &keys)
+	if len(keys) < 2 {
+		t.Errorf("expected >= 2 keys, got %d", len(keys))
+	}
+}
+
+func TestCreateKeyMissingFields(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/keys", `{}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDeleteMessage(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"to-delete"}`, key)
+	msg := parseJSON(t, rec)
+	msgID := msg["id"].(string)
+
+	rec2 := doReq(srv, "DELETE", "/api/channels/ch1/messages/"+msgID, "", key)
+	if rec2.Code != 204 {
+		t.Errorf("delete: status = %d", rec2.Code)
+	}
+
+	// Delete nonexistent
+	rec3 := doReq(srv, "DELETE", "/api/channels/ch1/messages/9999999999-0", "", key)
+	if rec3.Code != 404 {
+		t.Errorf("delete nonexistent: status = %d, want 404", rec3.Code)
+	}
+
+	// Invalid ID format
+	rec4 := doReq(srv, "DELETE", "/api/channels/ch1/messages/badid", "", key)
+	if rec4.Code != 400 {
+		t.Errorf("bad id: status = %d, want 400", rec4.Code)
+	}
+}
+
+func TestUnread(t *testing.T) {
+	srv, key := setup(t)
+	doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"msg1"}`, key)
+	doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"msg2"}`, key)
+
+	rec := doReq(srv, "GET", "/api/channels/ch1/unread", "", key)
+	if rec.Code != 200 {
+		t.Fatalf("unread: status = %d", rec.Code)
+	}
+	var result map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &result)
+	msgs := result["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Errorf("expected 2 unread, got %d", len(msgs))
+	}
+}
+
+func TestUnreadBadLimit(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "GET", "/api/channels/ch1/unread?limit=0", "", key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDeleteStatus(t *testing.T) {
+	srv, key := setup(t)
+	doReq(srv, "PUT", "/api/channels/ch1/status", `{"key":"temp","value":"x"}`, key)
+
+	rec := doReq(srv, "DELETE", "/api/channels/ch1/status/temp", "", key)
+	if rec.Code != 204 {
+		t.Errorf("delete: status = %d", rec.Code)
+	}
+
+	// Delete nonexistent
+	rec2 := doReq(srv, "DELETE", "/api/channels/ch1/status/nope", "", key)
+	if rec2.Code != 404 {
+		t.Errorf("nonexistent: status = %d, want 404", rec2.Code)
+	}
+}
+
+func TestStatusMissingKey(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "PUT", "/api/channels/ch1/status", `{"value":"v"}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestStatusValueTooLarge(t *testing.T) {
+	srv, key := setup(t)
+	big := strings.Repeat("v", store.MaxStatusValueLength+1)
+	rec := doReq(srv, "PUT", "/api/channels/ch1/status", `{"key":"k","value":"`+big+`"}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAckBadCursor(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/ack", `{"last_read_id":"bad"}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	m := parseJSON(t, rec)
+	if m["code"] != "INVALID_CURSOR" {
+		t.Errorf("code = %v", m["code"])
+	}
+}
+
+func TestAckMissingField(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/ack", `{}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestStatusChangesWithCursor(t *testing.T) {
+	srv, key := setup(t)
+	doReq(srv, "PUT", "/api/channels/ch1/status", `{"key":"k","value":"1"}`, key)
+	doReq(srv, "PUT", "/api/channels/ch1/status", `{"key":"k","value":"2"}`, key)
+	doReq(srv, "PUT", "/api/channels/ch1/status", `{"key":"k","value":"3"}`, key)
+
+	// Forward pagination from 0-0
+	rec := doReq(srv, "GET", "/api/channels/ch1/status/changes?after_id=0-0&limit=2", "", key)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var r1 map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &r1)
+	changes1 := r1["changes"].([]interface{})
+	if len(changes1) != 2 {
+		t.Fatalf("page 1: expected 2, got %d", len(changes1))
+	}
+	if r1["has_more"] != true {
+		t.Error("expected has_more=true")
+	}
+
+	// Page 2
+	cursor := r1["next_after_id"].(string)
+	rec2 := doReq(srv, "GET", "/api/channels/ch1/status/changes?after_id="+cursor+"&limit=10", "", key)
+	if rec2.Code != 200 {
+		t.Fatalf("status = %d", rec2.Code)
+	}
+	var r2 map[string]interface{}
+	json.Unmarshal(rec2.Body.Bytes(), &r2)
+	changes2 := r2["changes"].([]interface{})
+	if len(changes2) != 1 {
+		t.Errorf("page 2: expected 1, got %d", len(changes2))
+	}
+}
+
+func TestStatusChangesBadCursor(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "GET", "/api/channels/ch1/status/changes?after_id=bad", "", key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestStatusChangesBadLimit(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "GET", "/api/channels/ch1/status/changes?limit=abc", "", key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestThreadBadCursor(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "GET", "/api/channels/ch1/threads/badid", "", key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestThreadBadAfterID(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"p"}`, key)
+	pid := parseJSON(t, rec)["id"].(string)
+	rec2 := doReq(srv, "GET", "/api/channels/ch1/threads/"+pid+"?after_id=bad", "", key)
+	if rec2.Code != 400 {
+		t.Errorf("status = %d, want 400", rec2.Code)
+	}
+}
+
+func TestThreadBadLimit(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"p"}`, key)
+	pid := parseJSON(t, rec)["id"].(string)
+	rec2 := doReq(srv, "GET", "/api/channels/ch1/threads/"+pid+"?limit=999", "", key)
+	if rec2.Code != 400 {
+		t.Errorf("status = %d, want 400", rec2.Code)
+	}
+}
+
+func TestSignupBadJSON(t *testing.T) {
+	srv, _ := setup(t)
+	rec := doReq(srv, "POST", "/api/signup", `{bad`, "")
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestContentTooLargeExact(t *testing.T) {
+	srv, key := setup(t)
+	// Exactly at limit should pass
+	exact := strings.Repeat("x", store.MaxContentLength)
+	rec := doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"`+exact+`"}`, key)
+	if rec.Code != 201 {
+		t.Errorf("exact limit: status = %d, want 201", rec.Code)
+	}
+}
+
+func TestMissingContent(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/messages", `{"mention":"x"}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestBadThreadID(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels/ch1/messages", `{"content":"x","thread_id":"bad"}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestReadMessagesBadThreadID(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "GET", "/api/channels/ch1/messages?thread_id=bad", "", key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestJSON404(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "GET", "/api/nonexistent", "", key)
+	if rec.Code != 404 {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+	m := parseJSON(t, rec)
+	if m["code"] != "NOT_FOUND" {
+		t.Errorf("code = %v", m["code"])
+	}
+}
+
+func TestChannelMissingName(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "POST", "/api/channels", `{"description":"x"}`, key)
+	if rec.Code != 400 {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDeleteChannelNotFound(t *testing.T) {
+	srv, key := setup(t)
+	rec := doReq(srv, "DELETE", "/api/channels/nonexistent", "", key)
+	if rec.Code != 404 {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestXApiKeyAuth(t *testing.T) {
+	srv, key := setup(t)
+	req := httptest.NewRequest("GET", "/api/channels", nil)
+	req.Header.Set("X-Api-Key", key)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("X-Api-Key auth: status = %d, want 200", rec.Code)
+	}
+}
+
+func TestSignupIPRateLimit(t *testing.T) {
+	rdb := testutil.RedisClient(t)
+	testutil.FlushDB(t, rdb)
+	s := store.New(rdb)
+	cfg := DefaultConfig()
+	cfg.SignupPerIPMax = 2 // low limit for testing
+	srv := New(s, rdb, cfg)
+
+	doReq(srv, "POST", "/api/signup", `{"team_name":"t1","sender_name":"a"}`, "")
+	doReq(srv, "POST", "/api/signup", `{"team_name":"t2","sender_name":"a"}`, "")
+	rec := doReq(srv, "POST", "/api/signup", `{"team_name":"t3","sender_name":"a"}`, "")
+	if rec.Code != 429 {
+		t.Errorf("3rd signup: status = %d, want 429", rec.Code)
+	}
+}
+
+func TestKeyLimitReached(t *testing.T) {
+	rdb := testutil.RedisClient(t)
+	testutil.FlushDB(t, rdb)
+	s := store.New(rdb)
+	cfg := DefaultConfig()
+	cfg.MaxKeysPerTeam = 2 // team + 1 extra = 2 total
+	srv := New(s, rdb, cfg)
+
+	// Signup creates first key
+	rec := doReq(srv, "POST", "/api/signup", `{"team_name":"limited","sender_name":"a1"}`, "")
+	key := parseJSON(t, rec)["api_key"].(string)
+
+	// Second key OK
+	doReq(srv, "POST", "/api/keys", `{"sender_name":"a2"}`, key)
+
+	// Third key should fail
+	rec3 := doReq(srv, "POST", "/api/keys", `{"sender_name":"a3"}`, key)
+	if rec3.Code != 403 {
+		t.Errorf("3rd key: status = %d, want 403", rec3.Code)
+	}
+}
+
+func TestChannelLimitReached(t *testing.T) {
+	rdb := testutil.RedisClient(t)
+	testutil.FlushDB(t, rdb)
+	s := store.New(rdb)
+	cfg := DefaultConfig()
+	cfg.MaxChannelsPerTeam = 2
+	srv := New(s, rdb, cfg)
+
+	rec := doReq(srv, "POST", "/api/signup", `{"team_name":"limited","sender_name":"a"}`, "")
+	key := parseJSON(t, rec)["api_key"].(string)
+
+	doReq(srv, "POST", "/api/channels", `{"name":"ch1"}`, key)
+	doReq(srv, "POST", "/api/channels", `{"name":"ch2"}`, key)
+	rec3 := doReq(srv, "POST", "/api/channels", `{"name":"ch3"}`, key)
+	if rec3.Code != 403 {
+		t.Errorf("3rd channel: status = %d, want 403", rec3.Code)
+	}
+}

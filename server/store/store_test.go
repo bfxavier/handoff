@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"github.com/bfxavier/handoff/server/testutil"
+	"github.com/redis/go-redis/v9"
 )
+
+var _ = redis.Nil // ensure import
 
 func setup(t *testing.T) (*Store, context.Context) {
 	t.Helper()
@@ -536,5 +539,198 @@ func TestBlockingRead(t *testing.T) {
 	}
 	if len(msgs2) != 0 {
 		t.Errorf("expected 0 msgs on timeout, got %d", len(msgs2))
+	}
+}
+
+// ---- Additional coverage tests ----
+
+func TestErrorTypes(t *testing.T) {
+	e1 := ErrNotFound{What: "message"}
+	if e1.Error() != "message not found" {
+		t.Errorf("ErrNotFound.Error() = %q", e1.Error())
+	}
+	e2 := ErrValidation{Message: "bad input"}
+	if e2.Error() != "bad input" {
+		t.Errorf("ErrValidation.Error() = %q", e2.Error())
+	}
+}
+
+func TestRedisAccessor(t *testing.T) {
+	s, _ := setup(t)
+	if s.Redis() == nil {
+		t.Error("Redis() returned nil")
+	}
+}
+
+func TestListApiKeys(t *testing.T) {
+	s, ctx := setup(t)
+	team, key1, _ := s.CreateTeam(ctx, "list-keys-team", "agent-1")
+	key2, _ := s.CreateApiKey(ctx, team.ID, "agent-2")
+	_ = key1
+	_ = key2
+
+	keys, err := s.ListApiKeys(ctx, team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+	// Keys should be masked
+	for _, k := range keys {
+		if len(k.Key) > 20 {
+			t.Error("key should be masked but looks full length")
+		}
+		if k.TeamID != team.ID {
+			t.Error("wrong team")
+		}
+	}
+}
+
+func TestGetUnread(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+
+	msg1, _ := s.PostMessage(ctx, teamID, "ch1", "alice", "msg1", nil, nil)
+	s.PostMessage(ctx, teamID, "ch1", "alice", "msg2", nil, nil)
+	s.PostMessage(ctx, teamID, "ch1", "alice", "msg3", nil, nil)
+
+	// Before any ack — all messages unread
+	unread, err := s.GetUnread(ctx, teamID, "ch1", "bob", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unread.Messages) != 3 {
+		t.Fatalf("expected 3 unread, got %d", len(unread.Messages))
+	}
+
+	// Ack first message
+	s.AckMessages(ctx, teamID, "ch1", "bob", msg1.ID)
+
+	unread2, _ := s.GetUnread(ctx, teamID, "ch1", "bob", 50)
+	if len(unread2.Messages) != 2 {
+		t.Errorf("expected 2 unread after ack, got %d", len(unread2.Messages))
+	}
+}
+
+func TestDeleteStatus(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+
+	s.SetStatus(ctx, teamID, "ch1", "temp", "value", nil)
+	deleted, err := s.DeleteStatus(ctx, teamID, "ch1", "temp")
+	if err != nil || !deleted {
+		t.Fatalf("delete: deleted=%v err=%v", deleted, err)
+	}
+
+	// Should be gone
+	ch := "ch1"
+	key := "temp"
+	statuses, _ := s.GetStatus(ctx, teamID, &ch, &key)
+	if len(statuses) != 0 {
+		t.Errorf("expected 0 statuses after delete, got %d", len(statuses))
+	}
+
+	// Delete nonexistent
+	deleted2, _ := s.DeleteStatus(ctx, teamID, "ch1", "nonexistent")
+	if deleted2 {
+		t.Error("expected false for nonexistent")
+	}
+}
+
+func TestTrimMessages(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+
+	for i := 0; i < 20; i++ {
+		s.PostMessage(ctx, teamID, "ch1", "sender", "msg", nil, nil)
+	}
+
+	s.TrimMessages(ctx, teamID, "ch1", 10)
+
+	r, _ := s.ReadMessages(ctx, teamID, "ch1", nil, 100, nil, nil, nil)
+	if len(r.Messages) != 10 {
+		t.Errorf("expected 10 after trim, got %d", len(r.Messages))
+	}
+
+	// Trim with 0 should be no-op
+	s.TrimMessages(ctx, teamID, "ch1", 0)
+	r2, _ := s.ReadMessages(ctx, teamID, "ch1", nil, 100, nil, nil, nil)
+	if len(r2.Messages) != 10 {
+		t.Errorf("expected 10 after no-op trim, got %d", len(r2.Messages))
+	}
+}
+
+func TestGetStatusAllChannelsNoKey(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+	s.SetStatus(ctx, teamID, "ch1", "a", "1", nil)
+	s.SetStatus(ctx, teamID, "ch1", "b", "2", nil)
+	s.SetStatus(ctx, teamID, "ch2", "c", "3", nil)
+
+	// Cross-channel, no key filter
+	statuses, err := s.GetStatus(ctx, teamID, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 3 {
+		t.Errorf("expected 3, got %d", len(statuses))
+	}
+}
+
+func TestStatusChangesWithCursor(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+	s.SetStatus(ctx, teamID, "ch1", "k", "v1", nil)
+	s.SetStatus(ctx, teamID, "ch1", "k", "v2", nil)
+	s.SetStatus(ctx, teamID, "ch1", "k", "v3", nil)
+
+	// Page 1
+	r1, _ := s.GetStatusChanges(ctx, teamID, "ch1", nil, 2)
+	if len(r1.Changes) != 2 || !r1.HasMore {
+		t.Errorf("page 1: %d changes, has_more=%v", len(r1.Changes), r1.HasMore)
+	}
+
+	// Page 2
+	r2, _ := s.GetStatusChanges(ctx, teamID, "ch1", &r1.NextAfterID, 2)
+	if len(r2.Changes) != 1 || r2.HasMore {
+		t.Errorf("page 2: %d changes, has_more=%v", len(r2.Changes), r2.HasMore)
+	}
+}
+
+func TestSetStatusNilUpdatedBy(t *testing.T) {
+	s, ctx := setup(t)
+	st, err := s.SetStatus(ctx, "team1", "ch1", "k", "v", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.UpdatedBy != nil {
+		t.Errorf("expected nil updated_by, got %v", st.UpdatedBy)
+	}
+}
+
+func TestReadMessagesDefaultLimit(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+	for i := 0; i < 5; i++ {
+		s.PostMessage(ctx, teamID, "ch1", "sender", "msg", nil, nil)
+	}
+	// Pass 0 limit — should default to 50
+	r, _ := s.ReadMessages(ctx, teamID, "ch1", nil, 0, nil, nil, nil)
+	if len(r.Messages) != 5 {
+		t.Errorf("expected 5, got %d", len(r.Messages))
+	}
+}
+
+func TestReadThreadDefaultLimit(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "team1"
+	parent, _ := s.PostMessage(ctx, teamID, "ch1", "alice", "parent", nil, nil)
+	s.PostMessage(ctx, teamID, "ch1", "bob", "reply", nil, &parent.ID)
+
+	// Pass 0 limit — should default to 50
+	thread, _ := s.ReadThread(ctx, teamID, "ch1", parent.ID, nil, 0)
+	if len(thread.Replies) != 1 {
+		t.Errorf("expected 1, got %d", len(thread.Replies))
 	}
 }
