@@ -140,4 +140,4 @@ cd server && go test ./... -v
 
 ## License
 
-MIT
+Apache 2.0
