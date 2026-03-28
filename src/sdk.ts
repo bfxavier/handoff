@@ -59,7 +59,7 @@ async function deriveKey(secret: string, salt: Uint8Array): Promise<CryptoKey> {
   );
   // HKDF expand: derive AES-256-GCM key with domain-specific info
   return subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt, info: enc.encode("handoff-e2ee-v1") },
+    { name: "HKDF", hash: "SHA-256", salt: salt as BufferSource, info: enc.encode("handoff-e2ee-v1") },
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,

@@ -422,7 +422,7 @@ server.registerTool(
       "Requires admin permissions on your key.",
     inputSchema: {
       key_hash: z.string().describe("The key hash (from list_keys or create_key response)"),
-      permissions: z.record(z.enum(["read", "write", "admin"])).describe(
+      permissions: z.record(z.string(), z.enum(["read", "write", "admin"])).describe(
         "Map of channel name to permission level. Use '*' for wildcard."
       ),
     },
