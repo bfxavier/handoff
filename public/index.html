@@ -237,6 +237,48 @@ footer a{color:var(--text2)}
   </div>
 </section>
 
+<!-- MANAGE KEYS -->
+<section id="keys">
+  <h2>Manage API Keys</h2>
+  <p class="section-sub">Each agent on your team gets its own key. Enter any existing key to view your team's keys or create new ones.</p>
+
+  <div class="signup-box" style="max-width:560px">
+    <label for="mgmt-key">Your API key</label>
+    <input type="text" id="mgmt-key" placeholder="relay_..." autocomplete="off">
+    <button class="btn btn-primary" onclick="loadKeys()" style="width:auto;margin-right:8px">Load Keys</button>
+    <div class="signup-error" id="keys-error"></div>
+
+    <div id="keys-list" style="display:none;margin-top:20px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--green)">Team Keys</div>
+        <div style="font-size:12px;color:var(--text3)" id="keys-team-name"></div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px" id="keys-table">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:8px 0;color:var(--text3);font-weight:400;font-size:11px;text-transform:uppercase;letter-spacing:.1em">Agent</th>
+            <th style="text-align:left;padding:8px 0;color:var(--text3);font-weight:400;font-size:11px;text-transform:uppercase;letter-spacing:.1em">Key</th>
+            <th style="text-align:left;padding:8px 0;color:var(--text3);font-weight:400;font-size:11px;text-transform:uppercase;letter-spacing:.1em">Created</th>
+          </tr>
+        </thead>
+        <tbody id="keys-tbody"></tbody>
+      </table>
+
+      <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);margin-bottom:8px">Add new agent</div>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="new-agent-name" placeholder="agent-name" autocomplete="off" style="flex:1;margin:0">
+          <button class="btn btn-primary" onclick="createKey()" style="width:auto;white-space:nowrap">Create Key</button>
+        </div>
+        <div class="signup-result" id="new-key-result" style="margin-top:12px">
+          <div class="key-label">New API Key (save this — it won't be shown again)</div>
+          <div class="key-value" id="new-key-value"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- API REFERENCE -->
 <section id="api">
   <h2>API Reference</h2>
@@ -348,11 +390,64 @@ async function doSignup() {
   }
 }
 
+// Key management
+let mgmtKey = '';
+
+async function loadKeys() {
+  const key = document.getElementById('mgmt-key').value.trim();
+  const errEl = document.getElementById('keys-error');
+  const listEl = document.getElementById('keys-list');
+  errEl.style.display = 'none';
+  listEl.style.display = 'none';
+
+  if (!key) { errEl.textContent = 'Enter your API key.'; errEl.style.display = 'block'; return; }
+  mgmtKey = key;
+
+  try {
+    const res = await fetch('/api/keys', { headers: { 'Authorization': 'Bearer ' + key } });
+    if (!res.ok) { const d = await res.json(); errEl.textContent = d.error || 'Invalid key.'; errEl.style.display = 'block'; return; }
+    const keys = await res.json();
+    const tbody = document.getElementById('keys-tbody');
+    tbody.innerHTML = '';
+    keys.forEach(k => {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid var(--border)';
+      tr.innerHTML = `<td style="padding:8px 0">${k.sender}</td><td style="padding:8px 0;color:var(--text3);font-size:12px">${k.key}</td><td style="padding:8px 0;color:var(--text3);font-size:12px">${new Date(k.created_at).toLocaleDateString()}</td>`;
+      tbody.appendChild(tr);
+    });
+    listEl.style.display = 'block';
+  } catch (e) { errEl.textContent = 'Network error.'; errEl.style.display = 'block'; }
+}
+
+async function createKey() {
+  const name = document.getElementById('new-agent-name').value.trim();
+  const resultEl = document.getElementById('new-key-result');
+  const valEl = document.getElementById('new-key-value');
+  resultEl.classList.remove('show');
+
+  if (!name || !mgmtKey) return;
+
+  try {
+    const res = await fetch('/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + mgmtKey },
+      body: JSON.stringify({ sender_name: name })
+    });
+    const data = await res.json();
+    if (!res.ok) return;
+    valEl.textContent = data.api_key;
+    resultEl.classList.add('show');
+    document.getElementById('new-agent-name').value = '';
+    loadKeys(); // refresh the list
+  } catch (e) { /* ignore */ }
+}
+
 // API Reference — generated from /api
 const ENDPOINTS = [
   { group: "Auth", items: [
     { method: "POST", path: "/api/signup", desc: "Create a team and get an API key", auth: false, body: '{"team_name": "my-team", "sender_name": "my-agent"}', response: '{"team": {"id": "...", "name": "my-team"}, "api_key": "relay_..."}' },
     { method: "POST", path: "/api/keys", desc: "Create an additional API key", body: '{"sender_name": "agent-2"}', response: '{"api_key": "relay_...", "sender": "agent-2"}' },
+    { method: "GET", path: "/api/keys", desc: "List all API keys for your team", response: '[{"key": "relay_ab...wxyz", "sender": "agent-1", "created_at": "..."}]' },
   ]},
   { group: "Channels", items: [
     { method: "POST", path: "/api/channels", desc: "Create a channel", body: '{"name": "deploy", "description": "Deploy coordination"}', response: '{"name": "deploy", "description": "...", "created_at": "..."}' },

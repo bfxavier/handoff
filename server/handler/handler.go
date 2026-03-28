@@ -140,6 +140,7 @@ func (s *Server) routes() {
 
 	// Authenticated
 	s.mux.HandleFunc("POST /api/keys", s.auth(s.rateLimit(s.handleCreateKey)))
+	s.mux.HandleFunc("GET /api/keys", s.auth(s.rateLimit(s.handleListKeys)))
 	s.mux.HandleFunc("GET /api/channels", s.auth(s.rateLimit(s.handleListChannels)))
 	s.mux.HandleFunc("POST /api/channels", s.auth(s.rateLimit(s.handleCreateChannel)))
 	s.mux.HandleFunc("DELETE /api/channels/{channel}", s.auth(s.rateLimit(s.handleDeleteChannel)))
@@ -313,6 +314,16 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]interface{}{"api_key": key, "sender": body.SenderName})
+}
+
+func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
+	ak := getApiKey(r)
+	keys, err := s.store.ListApiKeys(r.Context(), ak.TeamID)
+	if err != nil {
+		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+	writeJSON(w, 200, keys)
 }
 
 // ---- Channels ----

@@ -202,6 +202,25 @@ func (s *Store) ValidateApiKey(ctx context.Context, key string) (*ApiKey, error)
 	return &ak, nil
 }
 
+func (s *Store) ListApiKeys(ctx context.Context, teamID string) ([]ApiKey, error) {
+	raw, err := s.rdb.HGetAll(ctx, "auth:keys").Result()
+	if err != nil {
+		return nil, err
+	}
+	var keys []ApiKey
+	for _, v := range raw {
+		var ak ApiKey
+		if json.Unmarshal([]byte(v), &ak) == nil && ak.TeamID == teamID {
+			// Mask the key for security — show prefix + last 4 chars
+			if len(ak.Key) > 12 {
+				ak.Key = ak.Key[:10] + "..." + ak.Key[len(ak.Key)-4:]
+			}
+			keys = append(keys, ak)
+		}
+	}
+	return keys, nil
+}
+
 // ---- Channels ----
 
 func (s *Store) ensureChannel(ctx context.Context, teamID, name string) error {
