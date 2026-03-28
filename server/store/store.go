@@ -29,6 +29,18 @@ var (
 	ChannelNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 )
 
+// Permissions
+
+type Permission string
+
+const (
+	PermRead  Permission = "read"
+	PermWrite Permission = "write"
+	PermAdmin Permission = "admin"
+)
+
+var permLevel = map[Permission]int{PermRead: 1, PermWrite: 2, PermAdmin: 3}
+
 // Domain types
 
 type Team struct {
@@ -38,10 +50,24 @@ type Team struct {
 }
 
 type ApiKey struct {
-	Key       string `json:"key"`
-	TeamID    string `json:"team_id"`
-	Sender    string `json:"sender"`
-	CreatedAt string `json:"created_at"`
+	Key         string                `json:"key"`
+	TeamID      string                `json:"team_id"`
+	Sender      string                `json:"sender"`
+	CreatedAt   string                `json:"created_at"`
+	Permissions map[string]Permission `json:"permissions,omitempty"`
+}
+
+func (ak *ApiKey) HasPermission(channel string, required Permission) bool {
+	if len(ak.Permissions) == 0 {
+		return true // legacy key = full access
+	}
+	if p, ok := ak.Permissions[channel]; ok {
+		return permLevel[p] >= permLevel[required]
+	}
+	if p, ok := ak.Permissions["*"]; ok {
+		return permLevel[p] >= permLevel[required]
+	}
+	return false
 }
 
 type Channel struct {
@@ -171,18 +197,21 @@ func (s *Store) CreateTeam(ctx context.Context, name, senderName string) (*Team,
 		return nil, "", err
 	}
 
-	apiKey, err := s.CreateApiKey(ctx, id, senderName)
+	apiKey, err := s.CreateApiKey(ctx, id, senderName, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	return team, apiKey, nil
 }
 
-func (s *Store) CreateApiKey(ctx context.Context, teamID, senderName string) (string, error) {
+func (s *Store) CreateApiKey(ctx context.Context, teamID, senderName string, perms map[string]Permission) (string, error) {
 	key := generateApiKeyStr()
 	keyHash := hashKey(key)
 	ts := now()
-	data := ApiKey{Key: keyHash, TeamID: teamID, Sender: senderName, CreatedAt: ts}
+	if perms == nil {
+		perms = map[string]Permission{"*": PermAdmin}
+	}
+	data := ApiKey{Key: keyHash, TeamID: teamID, Sender: senderName, CreatedAt: ts, Permissions: perms}
 	b, _ := json.Marshal(data)
 	pipe := s.rdb.Pipeline()
 	pipe.HSet(ctx, "auth:keys", keyHash, string(b))
@@ -242,6 +271,26 @@ func (s *Store) ListApiKeys(ctx context.Context, teamID string) ([]ApiKey, error
 		}
 	}
 	return keys, nil
+}
+
+func (s *Store) UpdateKeyPermissions(ctx context.Context, teamID, keyHash string, perms map[string]Permission) error {
+	raw, err := s.rdb.HGet(ctx, "auth:keys", keyHash).Result()
+	if err == redis.Nil {
+		return ErrNotFound{What: "api key"}
+	}
+	if err != nil {
+		return err
+	}
+	var ak ApiKey
+	if err := json.Unmarshal([]byte(raw), &ak); err != nil {
+		return err
+	}
+	if ak.TeamID != teamID {
+		return fmt.Errorf("key does not belong to team")
+	}
+	ak.Permissions = perms
+	b, _ := json.Marshal(ak)
+	return s.rdb.HSet(ctx, "auth:keys", keyHash, string(b)).Err()
 }
 
 // ---- Channels ----

@@ -852,6 +852,164 @@ func TestCreateKeySenderNameTooLong(t *testing.T) {
 
 // ---- DefaultConfig ensures quotas work ----
 
+// ---- Channel permissions ----
+
+func setupWithScopedKey(t *testing.T, perms map[string]store.Permission) (*Server, string, string) {
+	t.Helper()
+	rdb := testutil.RedisClient(t)
+	testutil.FlushDB(t, rdb)
+	s := store.New(rdb)
+	srv := New(s, rdb, DefaultConfig())
+
+	team, adminKey, err := s.CreateTeam(t.Context(), "perm-team", "admin-agent")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	_ = team
+
+	// Create a scoped key
+	scopedKey, err := s.CreateApiKey(t.Context(), team.ID, "scoped-agent", perms)
+	if err != nil {
+		t.Fatalf("setup scoped key: %v", err)
+	}
+	return srv, adminKey, scopedKey
+}
+
+func TestReadOnlyKeyCannotPost(t *testing.T) {
+	srv, _, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	// Create channel with admin key first isn't needed — ensureChannel auto-creates
+	rec := doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"hello"}`, scopedKey)
+	if rec.Code != 403 {
+		t.Errorf("status = %d, want 403; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReadOnlyKeyCanRead(t *testing.T) {
+	srv, adminKey, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	// Admin posts a message
+	doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"hello"}`, adminKey)
+
+	// Scoped key can read
+	rec := doReq(srv, "GET", "/api/channels/deploy/messages", "", scopedKey)
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWriteKeyCanPost(t *testing.T) {
+	srv, _, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermWrite})
+
+	rec := doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"hello"}`, scopedKey)
+	if rec.Code != 201 {
+		t.Errorf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWriteKeyCannotDeleteChannel(t *testing.T) {
+	srv, adminKey, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermWrite})
+
+	// Admin creates channel
+	doReq(srv, "POST", "/api/channels", `{"name":"deploy"}`, adminKey)
+
+	// Write key cannot delete
+	rec := doReq(srv, "DELETE", "/api/channels/deploy", "", scopedKey)
+	if rec.Code != 403 {
+		t.Errorf("status = %d, want 403; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminKeyCanDeleteChannel(t *testing.T) {
+	srv, adminKey, _ := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	doReq(srv, "POST", "/api/channels", `{"name":"deploy"}`, adminKey)
+	rec := doReq(srv, "DELETE", "/api/channels/deploy", "", adminKey)
+	if rec.Code != 204 {
+		t.Errorf("status = %d, want 204; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLegacyKeyFullAccess(t *testing.T) {
+	// setup() creates a key via CreateTeam which defaults to {"*": "admin"}
+	srv, key := setup(t)
+
+	rec := doReq(srv, "POST", "/api/channels", `{"name":"legacy-test"}`, key)
+	if rec.Code != 201 {
+		t.Errorf("create channel: status = %d, want 201", rec.Code)
+	}
+	rec2 := doReq(srv, "POST", "/api/channels/legacy-test/messages", `{"content":"hello"}`, key)
+	if rec2.Code != 201 {
+		t.Errorf("post message: status = %d, want 201", rec2.Code)
+	}
+	rec3 := doReq(srv, "DELETE", "/api/channels/legacy-test", "", key)
+	if rec3.Code != 204 {
+		t.Errorf("delete channel: status = %d, want 204", rec3.Code)
+	}
+}
+
+func TestScopedKeyDeniedOnOtherChannel(t *testing.T) {
+	srv, _, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermWrite})
+
+	// Can post to deploy
+	rec := doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"ok"}`, scopedKey)
+	if rec.Code != 201 {
+		t.Errorf("deploy post: status = %d, want 201", rec.Code)
+	}
+
+	// Cannot post to other channel (no wildcard, no match)
+	rec2 := doReq(srv, "POST", "/api/channels/production/messages", `{"content":"nope"}`, scopedKey)
+	if rec2.Code != 403 {
+		t.Errorf("production post: status = %d, want 403", rec2.Code)
+	}
+}
+
+func TestCreateKeyWithPermissions(t *testing.T) {
+	srv, key := setup(t)
+	body := `{"sender_name":"junior","permissions":{"deploy":"read","dev":"write"}}`
+	rec := doReq(srv, "POST", "/api/keys", body, key)
+	if rec.Code != 201 {
+		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+	m := parseJSON(t, rec)
+	perms := m["permissions"].(map[string]interface{})
+	if perms["deploy"] != "read" {
+		t.Errorf("deploy = %v, want read", perms["deploy"])
+	}
+	if perms["dev"] != "write" {
+		t.Errorf("dev = %v, want write", perms["dev"])
+	}
+}
+
+func TestUpdatePermissionsEndpoint(t *testing.T) {
+	rdb := testutil.RedisClient(t)
+	testutil.FlushDB(t, rdb)
+	s := store.New(rdb)
+	srv := New(s, rdb, DefaultConfig())
+
+	team, adminKey, _ := s.CreateTeam(t.Context(), "perm-crud-team", "admin")
+	scopedKey, _ := s.CreateApiKey(t.Context(), team.ID, "agent", map[string]store.Permission{"*": store.PermRead})
+
+	// Get the key hash by validating
+	ak, _ := s.ValidateApiKey(t.Context(), scopedKey)
+
+	// Update permissions
+	body := `{"permissions":{"deploy":"admin","*":"write"}}`
+	rec := doReq(srv, "PUT", "/api/keys/"+ak.Key+"/permissions", body, adminKey)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify updated perms
+	ak2, _ := s.ValidateApiKey(t.Context(), scopedKey)
+	if ak2.Permissions["deploy"] != store.PermAdmin {
+		t.Errorf("deploy = %v, want admin", ak2.Permissions["deploy"])
+	}
+	if ak2.Permissions["*"] != store.PermWrite {
+		t.Errorf("* = %v, want write", ak2.Permissions["*"])
+	}
+}
+
 func TestDefaultConfigAllowsSignupAndChannels(t *testing.T) {
 	// Verify DefaultConfig() has non-zero quotas (the old bug was Config{} with zero values)
 	rdb := testutil.RedisClient(t)

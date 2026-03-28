@@ -412,5 +412,34 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "set_key_permissions",
+  {
+    description:
+      "Set channel-scoped permissions for an API key. Permissions control which channels a key can read, write, or admin. " +
+      "Levels: 'read' (view messages/status), 'write' (read + post/ack/set status), 'admin' (write + delete). " +
+      "Use '*' as the channel name for a wildcard grant across all channels. " +
+      "Requires admin permissions on your key.",
+    inputSchema: {
+      key_hash: z.string().describe("The key hash (from list_keys or create_key response)"),
+      permissions: z.record(z.enum(["read", "write", "admin"])).describe(
+        "Map of channel name to permission level. Use '*' for wildcard."
+      ),
+    },
+  },
+  async (input) => {
+    try {
+      const result = await api(
+        "PUT",
+        `/api/keys/${encodeURIComponent(input.key_hash)}/permissions`,
+        { permissions: input.permissions }
+      );
+      return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

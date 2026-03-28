@@ -162,26 +162,35 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api", s.handleAPIInfo)
 	s.mux.HandleFunc("POST /api/signup", s.handleSignup)
 
-	// Authenticated
-	s.mux.HandleFunc("POST /api/keys", s.auth(s.rateLimit(s.handleCreateKey)))
-	s.mux.HandleFunc("GET /api/keys", s.auth(s.rateLimit(s.handleListKeys)))
-	s.mux.HandleFunc("GET /api/channels", s.auth(s.rateLimit(s.handleListChannels)))
-	s.mux.HandleFunc("POST /api/channels", s.auth(s.rateLimit(s.handleCreateChannel)))
-	s.mux.HandleFunc("DELETE /api/channels/{channel}", s.auth(s.requireValidChannel(s.rateLimit(s.handleDeleteChannel))))
-	s.mux.HandleFunc("POST /api/channels/{channel}/messages", s.auth(s.requireValidChannel(s.rateLimit(s.handlePostMessage))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/messages", s.auth(s.requireValidChannel(s.rateLimit(s.handleReadMessages))))
-	s.mux.HandleFunc("DELETE /api/channels/{channel}/messages/{id}", s.auth(s.requireValidChannel(s.rateLimit(s.handleDeleteMessage))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/threads/{id}", s.auth(s.requireValidChannel(s.rateLimit(s.handleReadThread))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/stream", s.auth(s.requireValidChannel(s.handleSSE)))
-	s.mux.HandleFunc("POST /api/channels/{channel}/ack", s.auth(s.requireValidChannel(s.rateLimit(s.handleAck))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/acks", s.auth(s.requireValidChannel(s.rateLimit(s.handleGetAcks))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/unread", s.auth(s.requireValidChannel(s.rateLimit(s.handleUnread))))
-	s.mux.HandleFunc("PUT /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.rateLimit(s.handleSetStatus))))
-	s.mux.HandleFunc("POST /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.rateLimit(s.handleSetStatus))))
-	s.mux.HandleFunc("DELETE /api/channels/{channel}/status/{key}", s.auth(s.requireValidChannel(s.rateLimit(s.handleDeleteStatus))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.rateLimit(s.handleGetStatus))))
-	s.mux.HandleFunc("GET /api/channels/{channel}/status/changes", s.auth(s.requireValidChannel(s.rateLimit(s.handleGetStatusChanges))))
-	s.mux.HandleFunc("GET /api/status", s.auth(s.rateLimit(s.handleGetStatusCrossChannel)))
+	// Authenticated — admin on *
+	s.mux.HandleFunc("POST /api/keys", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleCreateKey))))
+	s.mux.HandleFunc("GET /api/keys", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleListKeys))))
+	s.mux.HandleFunc("PUT /api/keys/{keyHash}/permissions", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleUpdatePermissions))))
+
+	// Authenticated — team-level
+	s.mux.HandleFunc("GET /api/channels", s.auth(s.requirePerm(store.PermRead)(s.rateLimit(s.handleListChannels))))
+	s.mux.HandleFunc("POST /api/channels", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleCreateChannel))))
+	s.mux.HandleFunc("GET /api/status", s.auth(s.requirePerm(store.PermRead)(s.rateLimit(s.handleGetStatusCrossChannel))))
+
+	// Authenticated — channel-level read
+	s.mux.HandleFunc("GET /api/channels/{channel}/messages", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.rateLimit(s.handleReadMessages)))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/threads/{id}", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.rateLimit(s.handleReadThread)))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/stream", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.handleSSE))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/acks", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.rateLimit(s.handleGetAcks)))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/unread", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.rateLimit(s.handleUnread)))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.rateLimit(s.handleGetStatus)))))
+	s.mux.HandleFunc("GET /api/channels/{channel}/status/changes", s.auth(s.requireValidChannel(s.requirePerm(store.PermRead)(s.rateLimit(s.handleGetStatusChanges)))))
+
+	// Authenticated — channel-level write
+	s.mux.HandleFunc("POST /api/channels/{channel}/messages", s.auth(s.requireValidChannel(s.requirePerm(store.PermWrite)(s.rateLimit(s.handlePostMessage)))))
+	s.mux.HandleFunc("POST /api/channels/{channel}/ack", s.auth(s.requireValidChannel(s.requirePerm(store.PermWrite)(s.rateLimit(s.handleAck)))))
+	s.mux.HandleFunc("PUT /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.requirePerm(store.PermWrite)(s.rateLimit(s.handleSetStatus)))))
+	s.mux.HandleFunc("POST /api/channels/{channel}/status", s.auth(s.requireValidChannel(s.requirePerm(store.PermWrite)(s.rateLimit(s.handleSetStatus)))))
+
+	// Authenticated — channel-level admin
+	s.mux.HandleFunc("DELETE /api/channels/{channel}", s.auth(s.requireValidChannel(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleDeleteChannel)))))
+	s.mux.HandleFunc("DELETE /api/channels/{channel}/messages/{id}", s.auth(s.requireValidChannel(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleDeleteMessage)))))
+	s.mux.HandleFunc("DELETE /api/channels/{channel}/status/{key}", s.auth(s.requireValidChannel(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleDeleteStatus)))))
 }
 
 // ---- Middleware ----
@@ -243,6 +252,27 @@ func (s *Server) rateLimit(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		next(w, r)
+	}
+}
+
+func (s *Server) requirePerm(level store.Permission) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			ak := getApiKey(r)
+			if ak == nil {
+				next(w, r)
+				return
+			}
+			ch := r.PathValue("channel")
+			if ch == "" {
+				ch = "*"
+			}
+			if !ak.HasPermission(ch, level) {
+				apiError(w, 403, "FORBIDDEN", "Insufficient permissions for this channel")
+				return
+			}
+			next(w, r)
+		}
 	}
 }
 
@@ -382,7 +412,8 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SenderName string `json:"sender_name"`
+		SenderName  string                        `json:"sender_name"`
+		Permissions map[string]store.Permission   `json:"permissions,omitempty"`
 	}
 	if err := readBody(r, &body); err != nil {
 		apiError(w, 400, "INVALID_JSON", "Request body must be valid JSON")
@@ -405,12 +436,46 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, err := s.store.CreateApiKey(r.Context(), ak.TeamID, body.SenderName)
+	key, err := s.store.CreateApiKey(r.Context(), ak.TeamID, body.SenderName, body.Permissions)
 	if err != nil {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
 		return
 	}
-	writeJSON(w, 201, map[string]interface{}{"api_key": key, "sender": body.SenderName})
+	resp := map[string]interface{}{"api_key": key, "sender": body.SenderName}
+	if body.Permissions != nil {
+		resp["permissions"] = body.Permissions
+	}
+	writeJSON(w, 201, resp)
+}
+
+func (s *Server) handleUpdatePermissions(w http.ResponseWriter, r *http.Request) {
+	keyHash := r.PathValue("keyHash")
+	if keyHash == "" {
+		apiError(w, 400, "MISSING_FIELDS", "key hash is required")
+		return
+	}
+	var body struct {
+		Permissions map[string]store.Permission `json:"permissions"`
+	}
+	if err := readBody(r, &body); err != nil {
+		apiError(w, 400, "INVALID_JSON", "Request body must be valid JSON")
+		return
+	}
+	if body.Permissions == nil {
+		apiError(w, 400, "MISSING_FIELDS", "permissions is required")
+		return
+	}
+	ak := getApiKey(r)
+	err := s.store.UpdateKeyPermissions(r.Context(), ak.TeamID, keyHash, body.Permissions)
+	if err != nil {
+		if _, ok := err.(store.ErrNotFound); ok {
+			apiError(w, 404, "KEY_NOT_FOUND", "API key not found")
+			return
+		}
+		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"key": keyHash, "permissions": body.Permissions})
 }
 
 func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
@@ -886,6 +951,16 @@ func (s *Server) handleGetStatusCrossChannel(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
 		return
+	}
+	// Filter to channels the key has read permission on
+	if len(ak.Permissions) > 0 {
+		filtered := make([]store.Status, 0, len(statuses))
+		for _, st := range statuses {
+			if ak.HasPermission(st.Channel, store.PermRead) {
+				filtered = append(filtered, st)
+			}
+		}
+		statuses = filtered
 	}
 	writeJSON(w, 200, statuses)
 }

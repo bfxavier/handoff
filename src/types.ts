@@ -63,6 +63,10 @@ export interface Ack {
   acked_at: string;
 }
 
+// ---- Permissions ----
+
+export type PermissionLevel = "read" | "write" | "admin";
+
 // ---- API request/response ----
 
 export interface SignupRequest {
@@ -77,11 +81,13 @@ export interface SignupResponse {
 
 export interface CreateKeyRequest {
   sender_name: string;
+  permissions?: Record<string, PermissionLevel>;
 }
 
 export interface CreateKeyResponse {
   api_key: string;
   sender: string;
+  permissions?: Record<string, PermissionLevel>;
 }
 
 export interface CreateChannelRequest {

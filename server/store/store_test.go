@@ -106,7 +106,7 @@ func TestCreateMultipleKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key2, err := s.CreateApiKey(ctx, team.ID, "agent-2")
+	key2, err := s.CreateApiKey(ctx, team.ID, "agent-2", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +565,7 @@ func TestRedisAccessor(t *testing.T) {
 func TestListApiKeys(t *testing.T) {
 	s, ctx := setup(t)
 	team, key1, _ := s.CreateTeam(ctx, "list-keys-team", "agent-1")
-	key2, _ := s.CreateApiKey(ctx, team.ID, "agent-2")
+	key2, _ := s.CreateApiKey(ctx, team.ID, "agent-2", nil)
 	_ = key1
 	_ = key2
 
@@ -893,5 +893,164 @@ func TestListChannelsEmpty(t *testing.T) {
 	}
 	if len(channels) != 0 {
 		t.Errorf("expected 0 channels, got %d", len(channels))
+	}
+}
+
+// ---- Permissions ----
+
+func TestHasPermission_NilMeansFullAccess(t *testing.T) {
+	ak := &ApiKey{TeamID: "t1", Sender: "agent"}
+	// nil permissions = legacy key = full access
+	if !ak.HasPermission("any-channel", PermRead) {
+		t.Error("nil perms should allow read")
+	}
+	if !ak.HasPermission("any-channel", PermWrite) {
+		t.Error("nil perms should allow write")
+	}
+	if !ak.HasPermission("any-channel", PermAdmin) {
+		t.Error("nil perms should allow admin")
+	}
+}
+
+func TestHasPermission_EmptyMapMeansFullAccess(t *testing.T) {
+	ak := &ApiKey{TeamID: "t1", Sender: "agent", Permissions: map[string]Permission{}}
+	if !ak.HasPermission("ch1", PermAdmin) {
+		t.Error("empty perms should allow admin")
+	}
+}
+
+func TestHasPermission_WildcardGrant(t *testing.T) {
+	ak := &ApiKey{Permissions: map[string]Permission{"*": PermWrite}}
+	if !ak.HasPermission("any-channel", PermRead) {
+		t.Error("wildcard write should allow read")
+	}
+	if !ak.HasPermission("any-channel", PermWrite) {
+		t.Error("wildcard write should allow write")
+	}
+	if ak.HasPermission("any-channel", PermAdmin) {
+		t.Error("wildcard write should NOT allow admin")
+	}
+}
+
+func TestHasPermission_ChannelSpecific(t *testing.T) {
+	ak := &ApiKey{Permissions: map[string]Permission{
+		"*":          PermAdmin,
+		"restricted": PermRead,
+	}}
+	// restricted channel: only read
+	if !ak.HasPermission("restricted", PermRead) {
+		t.Error("should allow read on restricted")
+	}
+	if ak.HasPermission("restricted", PermWrite) {
+		t.Error("should NOT allow write on restricted")
+	}
+	// other channels: admin via wildcard
+	if !ak.HasPermission("other", PermAdmin) {
+		t.Error("should allow admin on other via wildcard")
+	}
+}
+
+func TestHasPermission_LevelHierarchy(t *testing.T) {
+	ak := &ApiKey{Permissions: map[string]Permission{"ch": PermAdmin}}
+	if !ak.HasPermission("ch", PermRead) {
+		t.Error("admin should imply read")
+	}
+	if !ak.HasPermission("ch", PermWrite) {
+		t.Error("admin should imply write")
+	}
+	if !ak.HasPermission("ch", PermAdmin) {
+		t.Error("admin should allow admin")
+	}
+}
+
+func TestHasPermission_NoMatchDenies(t *testing.T) {
+	ak := &ApiKey{Permissions: map[string]Permission{"specific": PermRead}}
+	// no wildcard, no match for "other"
+	if ak.HasPermission("other", PermRead) {
+		t.Error("should deny read on unmatched channel with no wildcard")
+	}
+}
+
+func TestCreateApiKeyWithPermissions(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "perm-team"
+	perms := map[string]Permission{"deploy": PermRead, "dev": PermWrite}
+	key, err := s.CreateApiKey(ctx, teamID, "scoped-agent", perms)
+	if err != nil {
+		t.Fatalf("CreateApiKey: %v", err)
+	}
+	if key == "" {
+		t.Fatal("expected non-empty key")
+	}
+
+	// Validate and check permissions round-trip
+	ak, err := s.ValidateApiKey(ctx, key)
+	if err != nil {
+		t.Fatalf("ValidateApiKey: %v", err)
+	}
+	if ak == nil {
+		t.Fatal("expected non-nil ApiKey")
+	}
+	if len(ak.Permissions) != 2 {
+		t.Fatalf("expected 2 permissions, got %d", len(ak.Permissions))
+	}
+	if ak.Permissions["deploy"] != PermRead {
+		t.Errorf("deploy perm = %v, want read", ak.Permissions["deploy"])
+	}
+	if ak.Permissions["dev"] != PermWrite {
+		t.Errorf("dev perm = %v, want write", ak.Permissions["dev"])
+	}
+}
+
+func TestCreateApiKeyDefaultPermissions(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "default-perm-team"
+	key, err := s.CreateApiKey(ctx, teamID, "agent", nil)
+	if err != nil {
+		t.Fatalf("CreateApiKey: %v", err)
+	}
+
+	ak, err := s.ValidateApiKey(ctx, key)
+	if err != nil {
+		t.Fatalf("ValidateApiKey: %v", err)
+	}
+	if ak.Permissions["*"] != PermAdmin {
+		t.Errorf("default perm = %v, want admin on *", ak.Permissions["*"])
+	}
+}
+
+func TestUpdateKeyPermissions(t *testing.T) {
+	s, ctx := setup(t)
+	teamID := "update-perm-team"
+	key, _ := s.CreateApiKey(ctx, teamID, "agent", nil)
+
+	ak, _ := s.ValidateApiKey(ctx, key)
+	keyHash := ak.Key
+
+	// Update to restricted permissions
+	newPerms := map[string]Permission{"deploy": PermRead, "*": PermWrite}
+	err := s.UpdateKeyPermissions(ctx, teamID, keyHash, newPerms)
+	if err != nil {
+		t.Fatalf("UpdateKeyPermissions: %v", err)
+	}
+
+	// Verify
+	ak2, _ := s.ValidateApiKey(ctx, key)
+	if ak2.Permissions["deploy"] != PermRead {
+		t.Errorf("deploy = %v, want read", ak2.Permissions["deploy"])
+	}
+	if ak2.Permissions["*"] != PermWrite {
+		t.Errorf("* = %v, want write", ak2.Permissions["*"])
+	}
+}
+
+func TestUpdateKeyPermissions_WrongTeam(t *testing.T) {
+	s, ctx := setup(t)
+	key, _ := s.CreateApiKey(ctx, "team-a", "agent", nil)
+	ak, _ := s.ValidateApiKey(ctx, key)
+
+	err := s.UpdateKeyPermissions(ctx, "team-b", ak.Key, map[string]Permission{"*": PermRead})
+	if err == nil {
+		t.Error("expected error updating key from wrong team")
 	}
 }

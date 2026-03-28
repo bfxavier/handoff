@@ -2,10 +2,12 @@ import { EventEmitter } from "events";
 import { webcrypto } from "crypto";
 import type {
   Channel, Message, ReadResult, Status, StatusChange, Ack, ThreadResult,
+  PermissionLevel,
 } from "./types.js";
 
 export type {
   Channel, Message, ReadResult, Status, StatusChange, Ack, ThreadResult,
+  PermissionLevel,
 };
 
 export interface HandoffOptions {
@@ -420,6 +422,18 @@ export class Handoff {
     }
     return this.decryptStatuses(statuses);
   }
+
+  // ---- Keys & Permissions ----
+
+  async createKey(senderName: string, permissions?: Record<string, PermissionLevel>): Promise<{ api_key: string; sender: string; permissions?: Record<string, PermissionLevel> }> {
+    return this.request("POST", "/api/keys", { sender_name: senderName, permissions });
+  }
+
+  async updateKeyPermissions(keyHash: string, permissions: Record<string, PermissionLevel>): Promise<{ key: string; permissions: Record<string, PermissionLevel> }> {
+    return this.request("PUT", `/api/keys/${encodeURIComponent(keyHash)}/permissions`, { permissions });
+  }
+
+  // ---- Status Changes ----
 
   async getStatusChanges(channel: string, options?: StatusChangesOptions): Promise<{ changes: StatusChange[]; next_after_id: string; has_more: boolean }> {
     const params = new URLSearchParams();
