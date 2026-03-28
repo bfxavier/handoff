@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -181,7 +182,10 @@ func (s *Store) CreateApiKey(ctx context.Context, teamID, senderName string) (st
 	ts := now()
 	data := ApiKey{Key: key, TeamID: teamID, Sender: senderName, CreatedAt: ts}
 	b, _ := json.Marshal(data)
-	if err := s.rdb.HSet(ctx, "auth:keys", key, string(b)).Err(); err != nil {
+	pipe := s.rdb.Pipeline()
+	pipe.HSet(ctx, "auth:keys", key, string(b))
+	pipe.SAdd(ctx, "auth:team:"+teamID+":keys", key)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return "", err
 	}
 	return key, nil
@@ -203,14 +207,30 @@ func (s *Store) ValidateApiKey(ctx context.Context, key string) (*ApiKey, error)
 }
 
 func (s *Store) ListApiKeys(ctx context.Context, teamID string) ([]ApiKey, error) {
-	raw, err := s.rdb.HGetAll(ctx, "auth:keys").Result()
+	// Use per-team key set for O(team_keys) instead of O(total_keys)
+	keyNames, err := s.rdb.SMembers(ctx, "auth:team:"+teamID+":keys").Result()
 	if err != nil {
 		return nil, err
 	}
-	var keys []ApiKey
-	for _, v := range raw {
+	if len(keyNames) == 0 {
+		return []ApiKey{}, nil
+	}
+
+	pipe := s.rdb.Pipeline()
+	cmds := make([]*redis.StringCmd, len(keyNames))
+	for i, k := range keyNames {
+		cmds[i] = pipe.HGet(ctx, "auth:keys", k)
+	}
+	pipe.Exec(ctx)
+
+	keys := make([]ApiKey, 0, len(keyNames))
+	for _, cmd := range cmds {
+		raw, err := cmd.Result()
+		if err != nil {
+			continue
+		}
 		var ak ApiKey
-		if json.Unmarshal([]byte(v), &ak) == nil && ak.TeamID == teamID {
+		if json.Unmarshal([]byte(raw), &ak) == nil {
 			// Mask the key for security — show prefix + last 4 chars
 			if len(ak.Key) > 12 {
 				ak.Key = ak.Key[:10] + "..." + ak.Key[len(ak.Key)-4:]
@@ -306,10 +326,13 @@ func (s *Store) DeleteChannel(ctx context.Context, teamID, name string) (bool, e
 	for {
 		keys, next, err := s.rdb.Scan(ctx, cursor, s.k(teamID, "thr:"+name+":*"), 100).Result()
 		if err != nil {
+			log.Printf("warning: thread cleanup scan failed for channel %s: %v", name, err)
 			break
 		}
 		if len(keys) > 0 {
-			s.rdb.Del(ctx, keys...)
+			if err := s.rdb.Del(ctx, keys...).Err(); err != nil {
+				log.Printf("warning: thread cleanup del failed for channel %s: %v", name, err)
+			}
 		}
 		cursor = next
 		if cursor == 0 {
@@ -355,12 +378,16 @@ func (s *Store) PostMessage(ctx context.Context, teamID, channel, sender, conten
 
 	if threadID != nil {
 		thrKey := s.k(teamID, "thr:"+channel+":"+*threadID)
-		s.rdb.XAdd(ctx, &redis.XAddArgs{
+		thrPipe := s.rdb.Pipeline()
+		thrPipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: thrKey,
 			ID:     id,
 			Values: fields,
 		})
-		s.rdb.HIncrBy(ctx, s.k(teamID, "thrc:"+channel), *threadID, 1)
+		thrPipe.HIncrBy(ctx, s.k(teamID, "thrc:"+channel), *threadID, 1)
+		if _, err := thrPipe.Exec(ctx); err != nil {
+			return nil, fmt.Errorf("thread write failed: %w", err)
+		}
 	}
 
 	msg := &Message{
@@ -542,6 +569,35 @@ func (s *Store) ReadThread(ctx context.Context, teamID, channel, parentID string
 
 // ---- Acks ----
 
+// compareStreamIDs compares two Redis stream IDs numerically.
+// Returns 1 if a > b, -1 if a < b, 0 if equal.
+func compareStreamIDs(a, b string) int {
+	aParts := strings.SplitN(a, "-", 2)
+	bParts := strings.SplitN(b, "-", 2)
+	aTs, _ := strconv.ParseInt(aParts[0], 10, 64)
+	bTs, _ := strconv.ParseInt(bParts[0], 10, 64)
+	if aTs != bTs {
+		if aTs > bTs {
+			return 1
+		}
+		return -1
+	}
+	var aSeq, bSeq int64
+	if len(aParts) > 1 {
+		aSeq, _ = strconv.ParseInt(aParts[1], 10, 64)
+	}
+	if len(bParts) > 1 {
+		bSeq, _ = strconv.ParseInt(bParts[1], 10, 64)
+	}
+	if aSeq > bSeq {
+		return 1
+	}
+	if aSeq < bSeq {
+		return -1
+	}
+	return 0
+}
+
 func (s *Store) AckMessages(ctx context.Context, teamID, channel, sender, lastReadID string) (*Ack, error) {
 	key := s.k(teamID, "acks:"+channel)
 	existing, err := s.rdb.HGet(ctx, key, sender).Result()
@@ -550,7 +606,7 @@ func (s *Store) AckMessages(ctx context.Context, teamID, channel, sender, lastRe
 	if err == nil && existing != "" {
 		var prev Ack
 		if json.Unmarshal([]byte(existing), &prev) == nil {
-			if prev.LastReadID > lastReadID {
+			if compareStreamIDs(prev.LastReadID, lastReadID) > 0 {
 				effectiveID = prev.LastReadID
 			}
 		}
@@ -891,7 +947,3 @@ func statusLess(a, b Status) bool {
 // Ptr helpers for tests and handlers
 func Ptr(s string) *string { return &s }
 
-func init() {
-	// Ensure strings package is used
-	_ = strings.TrimSpace
-}

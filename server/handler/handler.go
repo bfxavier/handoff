@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,37 +19,46 @@ import (
 )
 
 type Config struct {
-	RateLimitMax      int
-	RateLimitWindowMs int64
-	SignupPerIPMax    int   // max signups per IP per hour
-	MaxKeysPerTeam    int   // max API keys per team
-	MaxChannelsPerTeam int  // max channels per team
-	MaxMsgsPerChannel int64 // max messages retained per channel (XTRIM)
-	MaxSSEPerKey      int   // max concurrent SSE connections per key
+	RateLimitMax       int
+	RateLimitWindowMs  int64
+	SignupPerIPMax     int      // max signups per IP per hour
+	MaxKeysPerTeam     int      // max API keys per team
+	MaxChannelsPerTeam int      // max channels per team
+	MaxMsgsPerChannel  int64    // max messages retained per channel (XTRIM)
+	MaxSSEPerKey       int      // max concurrent SSE connections per key
+	TrustedProxyCIDRs  []string // CIDRs that are allowed to set X-Forwarded-For
 }
 
 func DefaultConfig() Config {
 	return Config{
-		RateLimitMax:      100,
-		RateLimitWindowMs: 1000,
-		SignupPerIPMax:    10,
-		MaxKeysPerTeam:    20,
+		RateLimitMax:       100,
+		RateLimitWindowMs:  1000,
+		SignupPerIPMax:     10,
+		MaxKeysPerTeam:     20,
 		MaxChannelsPerTeam: 50,
-		MaxMsgsPerChannel: 10000,
-		MaxSSEPerKey:      5,
+		MaxMsgsPerChannel:  10000,
+		MaxSSEPerKey:       5,
+		TrustedProxyCIDRs:  []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 	}
 }
 
 type Server struct {
-	store    *store.Store
-	rdb      *redis.Client
-	config   Config
-	mux      *http.ServeMux
-	sseConns sync.Map // key -> *int32 (atomic counter)
+	store       *store.Store
+	rdb         *redis.Client
+	config      Config
+	mux         *http.ServeMux
+	sseConns    sync.Map // key -> *int32 (atomic counter)
+	trustedNets []*net.IPNet
 }
 
 func New(s *store.Store, rdb *redis.Client, cfg Config) *Server {
 	srv := &Server{store: s, rdb: rdb, config: cfg}
+	for _, cidr := range cfg.TrustedProxyCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			srv.trustedNets = append(srv.trustedNets, ipNet)
+		}
+	}
 	srv.mux = http.NewServeMux()
 	srv.routes()
 	return srv
@@ -288,19 +298,43 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 
 // ---- Auth endpoints ----
 
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.Split(fwd, ",")[0]
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
 	}
-	if real := r.Header.Get("X-Real-IP"); real != "" {
-		return real
+	return host
+}
+
+func (s *Server) isTrustedProxy(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
 	}
-	return strings.Split(r.RemoteAddr, ":")[0]
+	for _, n := range s.trustedNets {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) clientIP(r *http.Request) string {
+	remote := remoteIP(r)
+	if s.isTrustedProxy(remote) {
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			return strings.TrimSpace(strings.Split(fwd, ",")[0])
+		}
+		if real := r.Header.Get("X-Real-IP"); real != "" {
+			return strings.TrimSpace(real)
+		}
+	}
+	return remote
 }
 
 func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	// IP-based rate limit for signups
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	allowed, _, _ := s.store.CheckRateLimit(r.Context(), "signup:"+ip, s.config.SignupPerIPMax, 3600000) // per hour
 	if !allowed {
 		apiError(w, 429, "SIGNUP_RATE_LIMITED", "Too many signups from this IP. Try again later.")
@@ -651,8 +685,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Dedicated Redis connection for blocking reads
-	subRdb := redis.NewClient(s.rdb.Options())
+	// Dedicated Redis connection for blocking reads (PoolSize=1 to avoid wasting connections)
+	subOpts := *s.rdb.Options()
+	subOpts.PoolSize = 1
+	subRdb := redis.NewClient(&subOpts)
 	defer subRdb.Close()
 	subStore := store.New(subRdb)
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,8 +19,22 @@ import (
 func main() {
 	port := envOr("PORT", "3000")
 	redisURL := envOr("REDIS_URL", "redis://localhost:6379")
-	rateLimitMax, _ := strconv.Atoi(envOr("RATE_LIMIT_MAX", "100"))
-	rateLimitWindowMs, _ := strconv.ParseInt(envOr("RATE_LIMIT_WINDOW_MS", "1000"), 10, 64)
+	rateLimitMax := 100
+	if v := os.Getenv("RATE_LIMIT_MAX"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("invalid RATE_LIMIT_MAX %q: %v", v, err)
+		}
+		rateLimitMax = n
+	}
+	var rateLimitWindowMs int64 = 1000
+	if v := os.Getenv("RATE_LIMIT_WINDOW_MS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			log.Fatalf("invalid RATE_LIMIT_WINDOW_MS %q: %v", v, err)
+		}
+		rateLimitWindowMs = n
+	}
 
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
@@ -93,6 +106,3 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func init() {
-	_ = fmt.Sprintf // ensure fmt is used
-}

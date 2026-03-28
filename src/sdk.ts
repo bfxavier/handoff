@@ -45,15 +45,19 @@ export type ErrorHandler = (error: Error) => void;
 // ---- E2EE helpers ----
 
 const E2EE_PREFIX = "e2ee:";
+const HKDF_SALT_LEN = 32;
 const subtle = (globalThis.crypto?.subtle ?? webcrypto.subtle) as SubtleCrypto;
+const rng = globalThis.crypto ?? webcrypto;
 
-async function deriveKey(secret: string): Promise<CryptoKey> {
+async function deriveKey(secret: string, salt: Uint8Array): Promise<CryptoKey> {
   const enc = new TextEncoder();
+  // HKDF extract: import the secret as raw key material
   const keyMaterial = await subtle.importKey(
-    "raw", enc.encode(secret), "PBKDF2", false, ["deriveKey"]
+    "raw", enc.encode(secret), "HKDF", false, ["deriveKey"]
   );
+  // HKDF expand: derive AES-256-GCM key with domain-specific info
   return subtle.deriveKey(
-    { name: "PBKDF2", salt: enc.encode("handoff-e2ee-v1"), iterations: 100000, hash: "SHA-256" },
+    { name: "HKDF", hash: "SHA-256", salt, info: enc.encode("handoff-e2ee-v1") },
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,
@@ -61,28 +65,33 @@ async function deriveKey(secret: string): Promise<CryptoKey> {
   );
 }
 
-async function encrypt(key: CryptoKey, plaintext: string): Promise<string> {
+async function encrypt(secret: string, plaintext: string): Promise<string> {
   const enc = new TextEncoder();
+  const salt = new Uint8Array(HKDF_SALT_LEN);
+  (rng as Crypto).getRandomValues(salt);
+  const key = await deriveKey(secret, salt);
   const iv = new Uint8Array(12);
-  const rng = globalThis.crypto ?? webcrypto;
   (rng as Crypto).getRandomValues(iv);
   const ciphertext = await subtle.encrypt(
     { name: "AES-GCM", iv },
     key,
     enc.encode(plaintext)
   );
-  // Pack as: base64(iv + ciphertext)
-  const packed = new Uint8Array(iv.length + ciphertext.byteLength);
-  packed.set(iv);
-  packed.set(new Uint8Array(ciphertext), iv.length);
+  // Pack as: base64(salt + iv + ciphertext)
+  const packed = new Uint8Array(HKDF_SALT_LEN + iv.length + ciphertext.byteLength);
+  packed.set(salt);
+  packed.set(iv, HKDF_SALT_LEN);
+  packed.set(new Uint8Array(ciphertext), HKDF_SALT_LEN + iv.length);
   return E2EE_PREFIX + Buffer.from(packed).toString("base64");
 }
 
-async function decrypt(key: CryptoKey, encoded: string): Promise<string> {
+async function decrypt(secret: string, encoded: string): Promise<string> {
   if (!encoded.startsWith(E2EE_PREFIX)) return encoded; // plaintext passthrough
   const packed = new Uint8Array(Buffer.from(encoded.slice(E2EE_PREFIX.length), "base64"));
-  const iv = packed.slice(0, 12);
-  const ciphertext = packed.slice(12);
+  const salt = packed.slice(0, HKDF_SALT_LEN);
+  const iv = packed.slice(HKDF_SALT_LEN, HKDF_SALT_LEN + 12);
+  const ciphertext = packed.slice(HKDF_SALT_LEN + 12);
+  const key = await deriveKey(secret, salt);
   const plaintext = await subtle.decrypt(
     { name: "AES-GCM", iv },
     key,
@@ -223,8 +232,7 @@ export class Subscription extends EventEmitter {
 export class Handoff {
   private apiUrl: string;
   private apiKey: string;
-  private cryptoKey: CryptoKey | null = null;
-  private cryptoKeyPromise: Promise<CryptoKey> | null = null;
+  private encryptionKey: string | null = null;
 
   /** True if E2EE is enabled */
   readonly encrypted: boolean;
@@ -233,28 +241,17 @@ export class Handoff {
     this.apiUrl = options.apiUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
     this.encrypted = !!options.encryptionKey;
-    if (options.encryptionKey) {
-      this.cryptoKeyPromise = deriveKey(options.encryptionKey).then(k => {
-        this.cryptoKey = k;
-        return k;
-      });
-    }
-  }
-
-  private async getKey(): Promise<CryptoKey> {
-    if (this.cryptoKey) return this.cryptoKey;
-    if (this.cryptoKeyPromise) return this.cryptoKeyPromise;
-    throw new Error("E2EE not enabled");
+    this.encryptionKey = options.encryptionKey ?? null;
   }
 
   private async encryptContent(plaintext: string): Promise<string> {
-    if (!this.encrypted) return plaintext;
-    return encrypt(await this.getKey(), plaintext);
+    if (!this.encrypted || !this.encryptionKey) return plaintext;
+    return encrypt(this.encryptionKey, plaintext);
   }
 
   private async decryptContent(ciphertext: string): Promise<string> {
-    if (!this.encrypted) return ciphertext;
-    return decrypt(await this.getKey(), ciphertext);
+    if (!this.encrypted || !this.encryptionKey) return ciphertext;
+    return decrypt(this.encryptionKey, ciphertext);
   }
 
   private async decryptMessage(msg: Message): Promise<Message> {
