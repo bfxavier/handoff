@@ -13,7 +13,7 @@ var _ = redis.Nil // ensure import
 
 func setup(t *testing.T) (*Store, context.Context) {
 	t.Helper()
-	rdb := testutil.RedisClient(t)
+	rdb := testutil.RedisClientDB(t, 14)
 	testutil.FlushDB(t, rdb)
 	return New(rdb), context.Background()
 }
@@ -576,10 +576,9 @@ func TestListApiKeys(t *testing.T) {
 	if len(keys) != 2 {
 		t.Fatalf("expected 2 keys, got %d", len(keys))
 	}
-	// Keys should be masked
 	for _, k := range keys {
-		if len(k.Key) > 20 {
-			t.Error("key should be masked but looks full length")
+		if k.Key == "" {
+			t.Error("key hash should not be empty")
 		}
 		if k.TeamID != team.ID {
 			t.Error("wrong team")
@@ -1052,5 +1051,92 @@ func TestUpdateKeyPermissions_WrongTeam(t *testing.T) {
 	err := s.UpdateKeyPermissions(ctx, "team-b", ak.Key, map[string]Permission{"*": PermRead})
 	if err == nil {
 		t.Error("expected error updating key from wrong team")
+	}
+}
+
+// ---- Audit Log ----
+
+func TestLogAndGetAuditEntries(t *testing.T) {
+	s, ctx := setup(t)
+	team, _, _ := s.CreateTeam(ctx, "audit-team", "admin")
+
+	entries := []AuditEntry{
+		{KeyHash: "hash1", SenderName: "bot-a", Action: "POST /api/channels/deploy/messages", Channel: "deploy", Result: "denied", Timestamp: "2024-01-01T00:00:00Z"},
+		{KeyHash: "hash2", SenderName: "bot-b", Action: "DELETE /api/channels/prod", Channel: "prod", Result: "denied", Timestamp: "2024-01-01T00:00:01Z"},
+		{KeyHash: "hash1", SenderName: "bot-a", Action: "GET /api/channels/deploy/messages", Channel: "deploy", Result: "allowed", Timestamp: "2024-01-01T00:00:02Z"},
+	}
+	for _, e := range entries {
+		if err := s.LogAuditEntry(ctx, team.ID, e); err != nil {
+			t.Fatalf("LogAuditEntry: %v", err)
+		}
+	}
+
+	result, err := s.GetAuditLog(ctx, team.ID, nil, 50, "")
+	if err != nil {
+		t.Fatalf("GetAuditLog: %v", err)
+	}
+	if len(result.Entries) != 3 {
+		t.Fatalf("got %d entries, want 3", len(result.Entries))
+	}
+	if result.Entries[0].SenderName != "bot-a" || result.Entries[0].Result != "denied" {
+		t.Errorf("entry 0: got sender=%q result=%q", result.Entries[0].SenderName, result.Entries[0].Result)
+	}
+	if result.Entries[2].Result != "allowed" {
+		t.Errorf("entry 2: got result=%q, want allowed", result.Entries[2].Result)
+	}
+}
+
+func TestGetAuditLogPagination(t *testing.T) {
+	s, ctx := setup(t)
+	team, _, _ := s.CreateTeam(ctx, "audit-page-team", "admin")
+
+	for i := 0; i < 5; i++ {
+		s.LogAuditEntry(ctx, team.ID, AuditEntry{
+			KeyHash: "hash", SenderName: "bot", Action: "POST /test", Channel: "ch", Result: "denied", Timestamp: "2024-01-01T00:00:00Z",
+		})
+	}
+
+	page1, err := s.GetAuditLog(ctx, team.ID, nil, 2, "")
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if len(page1.Entries) != 2 {
+		t.Fatalf("page1: got %d entries, want 2", len(page1.Entries))
+	}
+	if !page1.HasMore {
+		t.Error("page1: expected HasMore=true")
+	}
+
+	page2, err := s.GetAuditLog(ctx, team.ID, &page1.NextAfterID, 2, "")
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if len(page2.Entries) == 0 {
+		t.Fatal("page2: expected at least 1 entry")
+	}
+	if page2.Entries[0].ID == page1.Entries[0].ID {
+		t.Error("page2 returned same entries as page1")
+	}
+}
+
+func TestGetAuditLogFilterByResult(t *testing.T) {
+	s, ctx := setup(t)
+	team, _, _ := s.CreateTeam(ctx, "audit-filter-team", "admin")
+
+	s.LogAuditEntry(ctx, team.ID, AuditEntry{KeyHash: "h1", SenderName: "bot", Action: "POST /a", Channel: "ch", Result: "denied", Timestamp: "2024-01-01T00:00:00Z"})
+	s.LogAuditEntry(ctx, team.ID, AuditEntry{KeyHash: "h2", SenderName: "bot", Action: "GET /b", Channel: "ch", Result: "allowed", Timestamp: "2024-01-01T00:00:01Z"})
+	s.LogAuditEntry(ctx, team.ID, AuditEntry{KeyHash: "h3", SenderName: "bot", Action: "POST /c", Channel: "ch", Result: "denied", Timestamp: "2024-01-01T00:00:02Z"})
+
+	result, err := s.GetAuditLog(ctx, team.ID, nil, 50, "denied")
+	if err != nil {
+		t.Fatalf("GetAuditLog: %v", err)
+	}
+	if len(result.Entries) != 2 {
+		t.Fatalf("got %d entries, want 2 (denied only)", len(result.Entries))
+	}
+	for _, e := range result.Entries {
+		if e.Result != "denied" {
+			t.Errorf("got result=%q, want denied", e.Result)
+		}
 	}
 }

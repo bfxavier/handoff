@@ -166,6 +166,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/keys", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleCreateKey))))
 	s.mux.HandleFunc("GET /api/keys", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleListKeys))))
 	s.mux.HandleFunc("PUT /api/keys/{keyHash}/permissions", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleUpdatePermissions))))
+	s.mux.HandleFunc("GET /api/audit", s.auth(s.requirePerm(store.PermAdmin)(s.rateLimit(s.handleGetAuditLog))))
 
 	// Authenticated — team-level
 	s.mux.HandleFunc("GET /api/channels", s.auth(s.requirePerm(store.PermRead)(s.rateLimit(s.handleListChannels))))
@@ -268,6 +269,14 @@ func (s *Server) requirePerm(level store.Permission) func(http.HandlerFunc) http
 				ch = "*"
 			}
 			if !ak.HasPermission(ch, level) {
+				s.store.LogAuditEntry(r.Context(), ak.TeamID, store.AuditEntry{
+					KeyHash:    ak.Key,
+					SenderName: ak.Sender,
+					Action:     r.Method + " " + r.URL.Path,
+					Channel:    ch,
+					Result:     "denied",
+					Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+				})
 				apiError(w, 403, "FORBIDDEN", "Insufficient permissions for this channel")
 				return
 			}
@@ -308,6 +317,7 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		"endpoints": []map[string]interface{}{
 			{"method": "POST", "path": "/api/signup", "description": "Create a team and get an API key", "auth": false},
 			{"method": "POST", "path": "/api/keys", "description": "Create an additional API key for the team"},
+			{"method": "GET", "path": "/api/audit", "description": "Read the permission audit log (query: after_id, limit, result)"},
 			{"method": "GET", "path": "/api/channels", "description": "List all channels"},
 			{"method": "POST", "path": "/api/channels", "description": "Create a channel"},
 			{"method": "DELETE", "path": "/api/channels/{channel}", "description": "Delete a channel and all its data"},
@@ -985,6 +995,33 @@ func (s *Server) handleGetStatusChanges(w http.ResponseWriter, r *http.Request) 
 	ak := getApiKey(r)
 	ch := r.PathValue("channel")
 	result, err := s.store.GetStatusChanges(r.Context(), ak.TeamID, ch, afterID, limit)
+	if err != nil {
+		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
+func (s *Server) handleGetAuditLog(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	afterID := strPtr(q.Get("after_id"))
+	if afterID != nil && !store.IsValidCursor(*afterID) {
+		apiError(w, 400, "INVALID_CURSOR", "Invalid after_id format. Expected a stream ID like '1234567890-0'")
+		return
+	}
+	limit := 50
+	if ls := q.Get("limit"); ls != "" {
+		l, err := strconv.Atoi(ls)
+		if err != nil || l < 1 || l > 100 {
+			apiError(w, 400, "INVALID_LIMIT", "limit must be an integer between 1 and 100")
+			return
+		}
+		limit = l
+	}
+	resultFilter := q.Get("result")
+
+	ak := getApiKey(r)
+	result, err := s.store.GetAuditLog(r.Context(), ak.TeamID, afterID, limit, resultFilter)
 	if err != nil {
 		apiError(w, 500, "INTERNAL_ERROR", "Internal server error")
 		return

@@ -469,6 +469,35 @@ server.registerTool(
 );
 
 server.registerTool(
+  "read_audit_log",
+  {
+    description:
+      "Read the permission audit log for your team. Shows when permission checks were denied " +
+      "(e.g. an agent tried to post to a channel it doesn't have write access to). " +
+      "Returns entries with key_hash, sender_name, action, channel, and result. " +
+      "Use after_id cursor for pagination. Requires admin permissions.",
+    inputSchema: {
+      after_id: z.string().optional().describe("Cursor from a previous read_audit_log call for pagination"),
+      limit: z.number().int().min(1).max(100).optional().describe("Max entries to return (default 50)"),
+      result: z.string().optional().describe("Filter by result: 'denied' or 'allowed'"),
+    },
+  },
+  async (input) => {
+    try {
+      const params = new URLSearchParams();
+      if (input.after_id) params.set("after_id", input.after_id);
+      if (input.limit !== undefined) params.set("limit", String(input.limit));
+      if (input.result) params.set("result", input.result);
+      const qs = params.size > 0 ? `?${params}` : "";
+      const result = await api("GET", `/api/audit${qs}`);
+      return ok(result);
+    } catch (e) {
+      return err(e);
+    }
+  }
+);
+
+server.registerTool(
   "list_keys",
   {
     description:

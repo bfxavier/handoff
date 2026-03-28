@@ -100,6 +100,7 @@ Full reference at [handoff.xaviair.dev](https://handoff.xaviair.dev).
 | POST | /api/signup | Create a team and get an API key |
 | POST | /api/keys | Create additional keys for teammates |
 | GET | /api/keys | List team keys (masked) |
+| GET | /api/audit | Permission audit log (denials) |
 | POST | /api/channels | Create a channel |
 | GET | /api/channels | List channels |
 | DELETE | /api/channels/{ch} | Delete a channel |

@@ -12,18 +12,25 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisClient returns a Redis client for testing.
+// RedisClient returns a Redis client for testing on the default db (15).
 // Uses REDIS_TEST_URL env var, defaults to localhost:6379 db 15.
 func RedisClient(t *testing.T) *redis.Client {
+	return RedisClientDB(t, 15)
+}
+
+// RedisClientDB returns a Redis client for testing on a specific db number.
+// Use different db numbers per package to avoid cross-package test interference.
+func RedisClientDB(t *testing.T, db int) *redis.Client {
 	t.Helper()
 	url := os.Getenv("REDIS_TEST_URL")
 	if url == "" {
-		url = "redis://localhost:6379/15"
+		url = fmt.Sprintf("redis://localhost:6379/%d", db)
 	}
 	opts, err := redis.ParseURL(url)
 	if err != nil {
 		t.Fatalf("invalid REDIS_TEST_URL: %v", err)
 	}
+	opts.DB = db
 	client := redis.NewClient(opts)
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		t.Skipf("redis not available: %v", err)

@@ -1036,3 +1036,112 @@ func TestDefaultConfigAllowsSignupAndChannels(t *testing.T) {
 		t.Errorf("create key status = %d, want 201; body: %s", rec3.Code, rec3.Body.String())
 	}
 }
+
+// ---- Audit Log ----
+
+func TestAuditLogOnDenial(t *testing.T) {
+	srv, adminKey, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	// Attempt a write with read-only key — should be denied
+	rec := doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"hello"}`, scopedKey)
+	if rec.Code != 403 {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+
+	// Admin reads audit log
+	rec2 := doReq(srv, "GET", "/api/audit", "", adminKey)
+	if rec2.Code != 200 {
+		t.Fatalf("audit status = %d, want 200; body: %s", rec2.Code, rec2.Body.String())
+	}
+
+	var result map[string]interface{}
+	json.Unmarshal(rec2.Body.Bytes(), &result)
+	entries := result["entries"].([]interface{})
+	if len(entries) == 0 {
+		t.Fatal("expected at least 1 audit entry")
+	}
+	entry := entries[len(entries)-1].(map[string]interface{})
+	if entry["result"] != "denied" {
+		t.Errorf("result = %v, want denied", entry["result"])
+	}
+	if entry["sender_name"] != "scoped-agent" {
+		t.Errorf("sender_name = %v, want scoped-agent", entry["sender_name"])
+	}
+	if entry["channel"] != "deploy" {
+		t.Errorf("channel = %v, want deploy", entry["channel"])
+	}
+}
+
+func TestAuditLogRequiresAdmin(t *testing.T) {
+	srv, _, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	rec := doReq(srv, "GET", "/api/audit", "", scopedKey)
+	if rec.Code != 403 {
+		t.Errorf("status = %d, want 403; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuditLogPaginationEndpoint(t *testing.T) {
+	srv, adminKey, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	// Trigger multiple denials
+	for i := 0; i < 5; i++ {
+		doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"nope"}`, scopedKey)
+	}
+
+	// Page 1
+	rec := doReq(srv, "GET", "/api/audit?limit=2", "", adminKey)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var page1 map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &page1)
+	entries1 := page1["entries"].([]interface{})
+	if len(entries1) != 2 {
+		t.Fatalf("page1: got %d entries, want 2", len(entries1))
+	}
+	if page1["has_more"] != true {
+		t.Error("page1: expected has_more=true")
+	}
+
+	// Page 2
+	cursor := page1["next_after_id"].(string)
+	rec2 := doReq(srv, "GET", "/api/audit?limit=2&after_id="+cursor, "", adminKey)
+	if rec2.Code != 200 {
+		t.Fatalf("page2 status = %d, want 200", rec2.Code)
+	}
+	var page2 map[string]interface{}
+	json.Unmarshal(rec2.Body.Bytes(), &page2)
+	entries2 := page2["entries"].([]interface{})
+	if len(entries2) == 0 {
+		t.Fatal("page2: expected at least 1 entry")
+	}
+	// Ensure different entries from page 1
+	e1id := entries1[0].(map[string]interface{})["id"].(string)
+	e2id := entries2[0].(map[string]interface{})["id"].(string)
+	if e1id == e2id {
+		t.Error("page2 returned same entries as page1")
+	}
+}
+
+func TestAuditLogResultFilter(t *testing.T) {
+	srv, adminKey, scopedKey := setupWithScopedKey(t, map[string]store.Permission{"deploy": store.PermRead})
+
+	// Trigger a denial
+	doReq(srv, "POST", "/api/channels/deploy/messages", `{"content":"nope"}`, scopedKey)
+
+	// Filter by denied
+	rec := doReq(srv, "GET", "/api/audit?result=denied", "", adminKey)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var result map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &result)
+	entries := result["entries"].([]interface{})
+	for _, e := range entries {
+		entry := e.(map[string]interface{})
+		if entry["result"] != "denied" {
+			t.Errorf("got result=%v, want denied", entry["result"])
+		}
+	}
+}

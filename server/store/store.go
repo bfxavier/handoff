@@ -124,6 +124,22 @@ type StatusChangesResult struct {
 	HasMore     bool           `json:"has_more"`
 }
 
+type AuditEntry struct {
+	ID         string `json:"id"`
+	KeyHash    string `json:"key_hash"`
+	SenderName string `json:"sender_name"`
+	Action     string `json:"action"`
+	Channel    string `json:"channel"`
+	Result     string `json:"result"`
+	Timestamp  string `json:"timestamp"`
+}
+
+type AuditResult struct {
+	Entries     []AuditEntry `json:"entries"`
+	NextAfterID string      `json:"next_after_id"`
+	HasMore     bool         `json:"has_more"`
+}
+
 type Ack struct {
 	Channel    string `json:"channel"`
 	Sender     string `json:"sender"`
@@ -915,6 +931,87 @@ func (s *Store) GetStatusChanges(ctx context.Context, teamID, channel string, af
 	return &StatusChangesResult{
 		Changes: changes, NextAfterID: nextAfterID, HasMore: hasMore,
 	}, nil
+}
+
+// ---- Audit Log ----
+
+func (s *Store) LogAuditEntry(ctx context.Context, teamID string, entry AuditEntry) error {
+	_, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.k(teamID, "audit"),
+		MaxLen: 10000,
+		Approx: true,
+		Values: map[string]interface{}{
+			"key_hash":    entry.KeyHash,
+			"sender_name": entry.SenderName,
+			"action":      entry.Action,
+			"channel":     entry.Channel,
+			"result":      entry.Result,
+			"timestamp":   entry.Timestamp,
+		},
+	}).Result()
+	return err
+}
+
+func (s *Store) GetAuditLog(ctx context.Context, teamID string, afterID *string, limit int, resultFilter string) (*AuditResult, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	logKey := s.k(teamID, "audit")
+	var entries []redis.XMessage
+	var err error
+
+	if afterID != nil {
+		entries, err = s.rdb.XRangeN(ctx, logKey, "("+*afterID, "+", int64(limit+1)).Result()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		entries, err = s.rdb.XRevRangeN(ctx, logKey, "+", "-", int64(limit+1)).Result()
+		if err != nil {
+			return nil, err
+		}
+		for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+			entries[i], entries[j] = entries[j], entries[i]
+		}
+	}
+
+	hasMore := len(entries) > limit
+	if hasMore {
+		entries = entries[:limit]
+	}
+
+	result := make([]AuditEntry, 0, len(entries))
+	for _, e := range entries {
+		ae := parseAuditEntry(e)
+		if resultFilter != "" && ae.Result != resultFilter {
+			continue
+		}
+		result = append(result, ae)
+	}
+
+	nextAfterID := "0-0"
+	if afterID != nil {
+		nextAfterID = *afterID
+	}
+	if len(result) > 0 {
+		nextAfterID = result[len(result)-1].ID
+	}
+
+	return &AuditResult{
+		Entries: result, NextAfterID: nextAfterID, HasMore: hasMore,
+	}, nil
+}
+
+func parseAuditEntry(e redis.XMessage) AuditEntry {
+	return AuditEntry{
+		ID:         e.ID,
+		KeyHash:    strOr(e.Values, "key_hash", ""),
+		SenderName: strOr(e.Values, "sender_name", ""),
+		Action:     strOr(e.Values, "action", ""),
+		Channel:    strOr(e.Values, "channel", ""),
+		Result:     strOr(e.Values, "result", ""),
+		Timestamp:  strOr(e.Values, "timestamp", ""),
+	}
 }
 
 // ---- Rate Limiting ----
